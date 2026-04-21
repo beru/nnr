@@ -1,9 +1,9 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
 #include <cstring>
-#include <malloc.h>
 
 namespace nnr {
 
@@ -283,7 +283,11 @@ void memory_planner_t::apply()
 {
     pool_.resize(slots_.size());
     for (int i = 0; i < (int)slots_.size(); ++i)
-        pool_[i] = _aligned_malloc(slots_[i].size, 64);
+        pool_[i] = nnr_aligned_alloc(slots_[i].size, 64);
+    // Fresh buffers are uninitialized; the next zero_pool() call must wipe
+    // them before the first inference. After that, ops overwrite their own
+    // outputs and per-run zeroing becomes redundant.
+    pool_zeroed_ = false;
 
     for (auto& lt : lifetimes_) {
         if (lt.slot_id < 0 || !pool_[lt.slot_id]) continue;
@@ -318,11 +322,8 @@ void memory_planner_t::apply()
         int vi = node->view_input_index();
         if (vi < 0 || node->folded) continue;
         for (auto* y : node->outputs) {
-            if (y && y->owns_data && y->data) {
-                if (y->type == NNR_DATA_TYPE_STRING)
-                    delete[] (std::string*)y->data;
-                else
-                    delete[] (char*)y->data;
+            if (y && y->owns_data && y->data && y->ndata > 0) {
+                delete_data(y->data, y->type);
                 y->data = nullptr;
                 y->owns_data = false;
             }
@@ -334,6 +335,7 @@ void memory_planner_t::zero_pool()
 {
     for (int i = 0; i < (int)slots_.size(); ++i)
         if (pool_[i]) memset(pool_[i], 0, slots_[i].size);
+    pool_zeroed_ = true;
 }
 
 void memory_planner_t::release()
@@ -348,10 +350,11 @@ void memory_planner_t::release()
     }
 
     for (auto* p : pool_)
-        _aligned_free(p);
+        nnr_aligned_free(p);
     pool_.clear();
     slots_.clear();
     lifetimes_.clear();
+    pool_zeroed_ = false;
 
     num_intermediates = 0;
     num_slots = 0;

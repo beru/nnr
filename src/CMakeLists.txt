@@ -16,6 +16,9 @@ include_directories(
 file(GLOB_RECURSE SRC_FILES ${PROJECT_SOURCE_DIR} *.h *.hpp *.c *.cpp)
 list(FILTER SRC_FILES EXCLUDE REGEX "${PROJECT_SOURCE_DIR}/build/.*")
 list(FILTER SRC_FILES EXCLUDE REGEX "${CMAKE_SOURCE_DIR}/third_party/.*")
+if(NOT NNR_ENABLE_WEBGPU)
+    list(FILTER SRC_FILES EXCLUDE REGEX "${PROJECT_SOURCE_DIR}/backend/webgpu/.*")
+endif()
 
 add_library(nnr
 	${SRC_FILES}
@@ -33,6 +36,7 @@ option(NNR_USE_POOL_V2 "Use adaptive dispatch thread pool v2 (default; set OFF f
 option(NNR_ENABLE_PROFILER "Enable instrumentation profiler (zero overhead when OFF)" OFF)
 option(NNR_USE_XBYAK "Enable Xbyak JIT code generation (x64 only)" ON)
 option(NNR_PROFILE_REORDERS "Dump NHWC/BLOCKED reorder count+bytes+time on exit" OFF)
+option(NNR_ENABLE_WEBGPU "Build the WebGPU backend (requires third_party/dawn submodule + Python 3)" OFF)
 
 if(NNR_ENABLE_PROFILER)
     target_compile_definitions(nnr PUBLIC NNR_ENABLE_PROFILER)
@@ -45,6 +49,10 @@ endif()
 if(NNR_USE_XBYAK)
     target_include_directories(nnr PRIVATE ${CMAKE_SOURCE_DIR}/third_party/xbyak)
     target_compile_definitions(nnr PUBLIC NNR_USE_XBYAK)
+endif()
+
+if(NNR_ENABLE_WEBGPU)
+    add_subdirectory(backend/webgpu)
 endif()
 
 if(NNR_NO_THREAD_POOL)

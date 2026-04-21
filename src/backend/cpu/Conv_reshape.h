@@ -354,24 +354,24 @@
 #endif
         }
         // FP16/BF16: pre-convert weights and bias to float32 (one-time cost in reshape)
-        _aligned_free(w_f32); w_f32 = nullptr;
-        _aligned_free(bias_f32); bias_f32 = nullptr;
+        nnr_aligned_free(w_f32); w_f32 = nullptr;
+        nnr_aligned_free(bias_f32); bias_f32 = nullptr;
         if (x->type == NNR_DATA_TYPE_FLOAT16) {
             size_t wn = w->ndata;
-            w_f32 = (float*)_aligned_malloc(wn * sizeof(float), 64);
+            w_f32 = (float*)nnr_aligned_alloc(wn * sizeof(float), 64);
             convert_f16_to_f32(w_f32, (const float16_t*)w->data, wn);
             if (inputs.size() > 2 && inputs[2]->data) {
                 size_t bn = inputs[2]->ndata;
-                bias_f32 = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                bias_f32 = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                 convert_f16_to_f32(bias_f32, (const float16_t*)inputs[2]->data, bn);
             }
         } else if (x->type == NNR_DATA_TYPE_BFLOAT16) {
             size_t wn = w->ndata;
-            w_f32 = (float*)_aligned_malloc(wn * sizeof(float), 64);
+            w_f32 = (float*)nnr_aligned_alloc(wn * sizeof(float), 64);
             convert_bf16_to_f32(w_f32, (const bfloat16_t*)w->data, wn);
             if (inputs.size() > 2 && inputs[2]->data) {
                 size_t bn = inputs[2]->ndata;
-                bias_f32 = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                bias_f32 = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                 convert_bf16_to_f32(bias_f32, (const bfloat16_t*)inputs[2]->data, bn);
             }
         }

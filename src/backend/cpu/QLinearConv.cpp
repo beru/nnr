@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "util.h"
 #include "conv_shape.h"
 #include "kernel/conv.h"
@@ -58,7 +59,7 @@ struct QLinearConv_operator : public operator_t {
     std::vector<size_t> k_off_base;     // [K4] oh-independent offsets
     std::vector<size_t> k_off_oh_all;   // [oH × K4] oh-expanded offsets
 
-    // Pre-allocated work buffers (avoid per-inference _aligned_malloc)
+    // Pre-allocated work buffers (avoid per-inference nnr_aligned_alloc)
     std::vector<uint8_t> x_pad_buf;     // padded input (pre-filled with x_zp)
     std::vector<int32_t> y_i32_buf;     // int32 GEMM output tile
     uint8_t x_pad_zp = 0;              // x_zp value used to pre-fill x_pad_buf
@@ -587,8 +588,8 @@ struct QLinearConv_operator : public operator_t {
             int padded_W = iW + pW + cpads[3];  // left + right padding
             size_t pad_plane = (size_t)padded_H * padded_W;
 
-            uint8_t* x_pad = (uint8_t*)_aligned_malloc(IC_padded * pad_plane, 64);
-            int32_t* y_i32 = (int32_t*)_aligned_malloc((size_t)M * spatial * sizeof(int32_t), 64);
+            uint8_t* x_pad = (uint8_t*)nnr_aligned_alloc(IC_padded * pad_plane, 64);
+            int32_t* y_i32 = (int32_t*)nnr_aligned_alloc((size_t)M * spatial * sizeof(int32_t), 64);
 
             for (int n = 0; n < oN; n++) {
                 // Fill padded input: x_zp everywhere, then copy actual channels
@@ -646,8 +647,8 @@ struct QLinearConv_operator : public operator_t {
                 }
             }
 
-            _aligned_free(x_pad);
-            _aligned_free(y_i32);
+            nnr_aligned_free(x_pad);
+            nnr_aligned_free(y_i32);
             return true;
         }
 
@@ -1090,11 +1091,11 @@ struct QLinearConv_operator : public operator_t {
                 // Pad ldc to 16-column boundary: NR=48 JIT writes full zmm (16 int32s) in tail
                 int tile_sp_padded = (tile_spatial_max + 15) & ~15;
 
-                int8_t* col_s = (int8_t*)_aligned_malloc((size_t)CHW * tile_spatial_max, 64);
+                int8_t* col_s = (int8_t*)nnr_aligned_alloc((size_t)CHW * tile_spatial_max, 64);
                 size_t col_pack_sz = int8::pack_b_int8_nr48_size(CHW, tile_spatial_max);
-                int8_t* col_packed = (int8_t*)_aligned_malloc(col_pack_sz, 64);
-                int32_t* col_col_sums = (int32_t*)_aligned_malloc((size_t)tile_sp_padded * sizeof(int32_t), 64);
-                int32_t* y_i32 = (int32_t*)_aligned_malloc((size_t)MM * tile_sp_padded * sizeof(int32_t), 64);
+                int8_t* col_packed = (int8_t*)nnr_aligned_alloc(col_pack_sz, 64);
+                int32_t* col_col_sums = (int32_t*)nnr_aligned_alloc((size_t)tile_sp_padded * sizeof(int32_t), 64);
+                int32_t* y_i32 = (int32_t*)nnr_aligned_alloc((size_t)MM * tile_sp_padded * sizeof(int32_t), 64);
 
                 const __m512i v128 = _mm512_set1_epi8((char)128);
 
@@ -1188,10 +1189,10 @@ struct QLinearConv_operator : public operator_t {
                     }
                 }
 
-                _aligned_free(col_s);
-                _aligned_free(col_packed);
-                _aligned_free(col_col_sums);
-                _aligned_free(y_i32);
+                nnr_aligned_free(col_s);
+                nnr_aligned_free(col_packed);
+                nnr_aligned_free(col_col_sums);
+                nnr_aligned_free(y_i32);
                 return true;
             }
         }
@@ -1246,7 +1247,7 @@ struct QLinearConv_operator : public operator_t {
 
         // Float path: convert int8→float, im2col + dgemm_packed_a, requantize.
         // Uses pre-packed FP32 weights from reshape for maximum GEMM performance.
-        float* x_f32 = (float*)_aligned_malloc(x->ndata * sizeof(float), 64);
+        float* x_f32 = (float*)nnr_aligned_alloc(x->ndata * sizeof(float), 64);
         {
             const T* px = (const T*)x->data;
             int32_t xzp = (int32_t)x_zp;
@@ -1265,8 +1266,8 @@ struct QLinearConv_operator : public operator_t {
             for (; i < total; i++)
                 x_f32[i] = (float)((int32_t)px[i] - xzp);
         }
-        float* col = (float*)_aligned_malloc((size_t)CHW * spatial * sizeof(float), 64);
-        float* y_f32 = (float*)_aligned_malloc((size_t)M * spatial * sizeof(float), 64);
+        float* col = (float*)nnr_aligned_alloc((size_t)CHW * spatial * sizeof(float), 64);
+        float* y_f32 = (float*)nnr_aligned_alloc((size_t)M * spatial * sizeof(float), 64);
 
         size_t per_group_pack = pack_a_size(MM, CHW);
 
@@ -1326,9 +1327,9 @@ struct QLinearConv_operator : public operator_t {
                 }
             }
         }
-        _aligned_free(x_f32);
-        _aligned_free(col);
-        _aligned_free(y_f32);
+        nnr_aligned_free(x_f32);
+        nnr_aligned_free(col);
+        nnr_aligned_free(y_f32);
         return true;
 
         return true;

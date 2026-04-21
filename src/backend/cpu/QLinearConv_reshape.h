@@ -71,7 +71,7 @@
             int MM_val = M_total / group;
 
             // Convert W to float32 (subtract zero-point) and pre-pack with pack_a
-            float* w_f32_tmp = (float*)_aligned_malloc(wt->ndata * sizeof(float), 64);
+            float* w_f32_tmp = (float*)nnr_aligned_alloc(wt->ndata * sizeof(float), 64);
             for (int oc = 0; oc < M_total; oc++) {
                 int32_t wzp = 0;
                 if (!per_channel_zp_ && w_zp_t->ndata > 0) {
@@ -93,7 +93,7 @@
             for (int g_idx = 0; g_idx < group; g_idx++)
                 pack_a(w_packed_f32.data() + g_idx * per_group,
                     w_f32_tmp + (size_t)g_idx * MM_val * CHW_val, MM_val, CHW_val);
-            _aligned_free(w_f32_tmp);
+            nnr_aligned_free(w_f32_tmp);
         }
 #ifdef NNR_ARCH_X64
         // Also pre-shift W for VNNI path (if available)

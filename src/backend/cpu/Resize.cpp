@@ -162,7 +162,7 @@ struct Resize_operator : public operator_t {
                 dims[a] = (int)std::floor(x->dims[a] * sc[i]);
             }
         }
-        y->reinit(x->type, dims);
+        if (!y->reinit(x->type, dims)) return false;
         return true;
     }
 

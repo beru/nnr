@@ -63,24 +63,26 @@ struct Gather_operator : public operator_t {
         const int axis_dim = data->dims[caxis];
         if (axis_dim <= 0) return false;
 
-        // Compute the number of elements in the prefix (before axis), indices, and suffix (after axis)
-        int outer = 1;
+        // Compute the number of elements in the prefix (before axis), indices, and suffix (after axis).
+        // Widened to int64_t because outer * axis_dim * inner overflows int32 on large embedding
+        // tables (vocab_size * hidden_dim easily exceeds 2^31 on real LLMs).
+        int64_t outer = 1;
         for (int i = 0; i < caxis; ++i) {
             outer *= data->dims[i];
         }
-        int inner = 1;
+        int64_t inner = 1;
         for (int i = caxis + 1; i < data_ndim; ++i) {
             inner *= data->dims[i];
         }
-        int indices_size = (int)indices->ndata;
+        int64_t indices_size = (int64_t)indices->ndata;
 
         // data layout: [outer, axis_dim, inner]
         // output layout: [outer, indices_size, inner]
-        for (int o = 0; o < outer; ++o) {
-            for (int idx = 0; idx < indices_size; ++idx) {
-                int index;
+        for (int64_t o = 0; o < outer; ++o) {
+            for (int64_t idx = 0; idx < indices_size; ++idx) {
+                int64_t index;
                 if (indices->type == NNR_DATA_TYPE_INT64) {
-                    index = (int)((const int64_t*)indices->data)[idx];
+                    index = ((const int64_t*)indices->data)[idx];
                 } else {
                     index = ((const int32_t*)indices->data)[idx];
                 }
@@ -92,7 +94,7 @@ struct Gather_operator : public operator_t {
                 }
                 const T* src = pdata + (o * axis_dim + index) * inner;
                 T* dst = py + (o * indices_size + idx) * inner;
-                for (int s = 0; s < inner; ++s) {
+                for (int64_t s = 0; s < inner; ++s) {
                     dst[s] = src[s];
                 }
             }

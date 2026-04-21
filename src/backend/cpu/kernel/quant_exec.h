@@ -7,6 +7,7 @@
 //       return exec_quantized_unary(this, [](float x) { return std::max(0.0f, x); });
 
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include <cmath>
 #include <algorithm>
 
@@ -218,8 +219,8 @@ inline bool exec_quantized_via_float(operator_t* op, ExecFloat&& exec_float) {
     // Allocate float buffers
     size_t nx = x->ndata;
     size_t ny = y->ndata;
-    float* x_f32 = (float*)_aligned_malloc(nx * sizeof(float), 64);
-    float* y_f32 = (float*)_aligned_malloc(ny * sizeof(float), 64);
+    float* x_f32 = (float*)nnr_aligned_alloc(nx * sizeof(float), 64);
+    float* y_f32 = (float*)nnr_aligned_alloc(ny * sizeof(float), 64);
 
     // Dequantize input
     dequantize_to_f32(x_f32, x->data, x->type, nx, x->quant_scale, x->quant_zero_point);
@@ -243,8 +244,8 @@ inline bool exec_quantized_via_float(operator_t* op, ExecFloat&& exec_float) {
     if (ok && y->is_quantized())
         quantize_from_f32(y->data, y->type, y_f32, ny, y->quant_scale, y->quant_zero_point);
 
-    _aligned_free(x_f32);
-    _aligned_free(y_f32);
+    nnr_aligned_free(x_f32);
+    nnr_aligned_free(y_f32);
     return ok;
 }
 

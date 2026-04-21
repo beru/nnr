@@ -1054,7 +1054,7 @@ inline void dgemm_packed_a(int n, int m, int o, const float* __restrict packed_A
     const bool prepack_b = (nj == 1 && m < JBLK);
     if (prepack_b) {
         size_t total = (size_t)nk * KC * JBLK;
-        shared_pb = (float*)_aligned_malloc(total * sizeof(float), 64);
+        shared_pb = (float*)nnr_aligned_alloc(total * sizeof(float), 64);
         if (shared_pb) {
             int jw = m;  // nj==1 means je-j0 == m
             for (int kt = 0; kt < nk; kt++) {
@@ -1236,7 +1236,7 @@ inline void dgemm_packed_a(int n, int m, int o, const float* __restrict packed_A
             post_fn.apply_rows(i0, ie, C, m, j0, jw);
     });
 
-    if (shared_pb) _aligned_free(shared_pb);
+    if (shared_pb) nnr_aligned_free(shared_pb);
 }
 
 // Batched GEMM for Winograd: performs 36 independent GEMMs sharing dispatch/threading.

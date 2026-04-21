@@ -179,6 +179,46 @@ struct fuse_silu_pass_t : pass_t {
     bool         once()  const override { return true; }
 };
 
+// WebGPU-only: fold consecutive same-shape f32 unary elementwise ops into one
+// dispatch. Gated internally on ctx->preferred_backend == WEBGPU, so it's a
+// no-op for the CPU backend even when fusion is enabled. Kept independent of
+// opt.fusion_enabled — that flag governs the CPU-side rewrite set and is
+// often disabled for WebGPU paths (see webgpu_e2e_graph.cpp) while the
+// WebGPU-native fusion below is always desirable.
+//
+// Registered at FUSION level, not PREPROCESS: PREPROCESS only runs from
+// context_t::run()'s first_run path, not from prepare() — callers that call
+// prepare() before run() (the e2e tests do) would otherwise silently skip
+// fusion. FUSION runs via both optimize() paths and post fold_run, which
+// has the added benefit of guaranteeing all input tensor shapes are
+// propagated by the time we build the fused op.
+struct fuse_webgpu_elementwise_pass_t : pass_t {
+    bool apply(graph_optimizer_t& /*opt*/, context_t* ctx) override
+    {
+        fuse_webgpu_elementwise(ctx);
+        return false;  // chain-building is single-pass; no cascade
+    }
+    const char*  name()  const override { return "fuse_webgpu_elementwise"; }
+    pass_level_t level() const override { return pass_level_t::FUSION; }
+    bool         once()  const override { return true; }
+};
+
+// WebGPU-only: absorb a FusedElementwiseChain that directly follows a
+// MatMul into the MatMul's output epilogue. Must run AFTER
+// fuse_webgpu_elementwise has built the chain nodes (registration order
+// controls FUSION-level ordering within a round). Gated internally on
+// preferred_backend == WEBGPU.
+struct fuse_webgpu_matmul_chain_pass_t : pass_t {
+    bool apply(graph_optimizer_t& /*opt*/, context_t* ctx) override
+    {
+        fuse_webgpu_matmul_chain(ctx);
+        return false;  // single-pass; no cascade
+    }
+    const char*  name()  const override { return "fuse_webgpu_matmul_chain"; }
+    pass_level_t level() const override { return pass_level_t::FUSION; }
+    bool         once()  const override { return true; }
+};
+
 struct fold_bn_qdq_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
@@ -250,10 +290,20 @@ struct fuse_post_ops_pass_t : pass_t {
     bool         once()  const override { return false; }
 };
 
+// Layout rewrites (NCHWc blocked, NHWC) are CPU-specific: the AVX/NEON
+// kernels are packed-aware, but the WebGPU Conv/BN/Pool kernels assume
+// plain NCHW. Skip these passes when the preferred backend is WebGPU,
+// otherwise the graph gets rewritten into layouts the WebGPU ops can't
+// consume and performance collapses (measured ~35% slowdown on cnn_bench
+// before this gate landed).
+static bool skip_for_webgpu(context_t* ctx) {
+    return ctx->preferred_backend == static_cast<uint8_t>(backend_t::WEBGPU);
+}
+
 struct assign_blocked_layouts_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
-        if (!opt.fusion_enabled || opt.no_blocked) return false;
+        if (!opt.fusion_enabled || opt.no_blocked || skip_for_webgpu(ctx)) return false;
         assign_blocked_layouts(ctx);
         return false;  // idempotent; no cascade
     }
@@ -265,7 +315,7 @@ struct assign_blocked_layouts_pass_t : pass_t {
 struct assign_layouts_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
-        if (!opt.fusion_enabled || opt.no_nhwc) return false;
+        if (!opt.fusion_enabled || opt.no_nhwc || skip_for_webgpu(ctx)) return false;
         assign_layouts(ctx);
         return false;  // idempotent; no cascade
     }
@@ -279,7 +329,7 @@ struct assign_layouts_pass_t : pass_t {
 struct optimize_transposes_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
-        if (!opt.fusion_enabled || opt.no_nhwc) return false;
+        if (!opt.fusion_enabled || opt.no_nhwc || skip_for_webgpu(ctx)) return false;
         optimize_transposes(ctx);
         return false;  // idempotent; no cascade
     }
@@ -347,6 +397,8 @@ struct pass_graph_optimizer_t : graph_optimizer_t {
         mgr_.add(std::make_unique<fuse_qdq_compute_pass_t>());
         mgr_.add(std::make_unique<fuse_qdq_pass_t>());
         mgr_.add(std::make_unique<fuse_post_ops_pass_t>());
+        mgr_.add(std::make_unique<fuse_webgpu_elementwise_pass_t>());
+        mgr_.add(std::make_unique<fuse_webgpu_matmul_chain_pass_t>());
 
         // LAYOUT and SCHEDULING are registered by the arch-specific subclass
         // because the blocked-layout cost model differs per arch, and order

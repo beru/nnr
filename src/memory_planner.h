@@ -48,6 +48,15 @@ private:
     std::vector<tensor_lifetime> lifetimes_;
     std::vector<buffer_slot> slots_;
     std::vector<void*> pool_;
+    // Cleared on apply() and set after the first zero_pool() call. Lets run()
+    // skip the per-inference memset of the whole activation pool once the
+    // underlying buffers have been zeroed at least once (F-PHP-001). Ops
+    // write their outputs before reading them, so leaving stale bytes in the
+    // pool across runs is safe.
+    bool pool_zeroed_ = false;
+public:
+    bool is_pool_zeroed() const { return pool_zeroed_; }
+    void mark_pool_zeroed() { pool_zeroed_ = true; }
 };
 
 } // namespace nnr

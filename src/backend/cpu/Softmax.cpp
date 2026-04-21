@@ -57,6 +57,12 @@ struct Softmax_13_operator : public operator_t {
         const T* px = (const T*)x->data;
         T* py = (T*)y->data;
 
+        // An ONNX tensor with a zero-length reduction axis is legal (e.g.
+        // dynamic-batch shapes). Avoid calling std::max_element on an empty
+        // range — that is UB — and avoid dividing by a trivially-zero sum.
+        // Output is already allocated and zero-initialized; nothing to do.
+        if (current == 0 || outer == 0 || inner == 0) return true;
+
         if (inner == 1) {
 #ifdef NNR_ARCH_X64
             if constexpr (std::is_same_v<T, float>) {

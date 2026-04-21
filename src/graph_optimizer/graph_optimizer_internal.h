@@ -38,6 +38,8 @@ void fuse_silu(context_t* ctx);
 void fuse_layer_norm(context_t* ctx);
 void fuse_gelu(context_t* ctx);
 void fuse_sdpa(context_t* ctx);
+void fuse_webgpu_elementwise(context_t* ctx);
+void fuse_webgpu_matmul_chain(context_t* ctx);
 void fold_constants(context_t* ctx);
 void detect_scroll_chains(graph_optimizer_t* opt, context_t* ctx);
 void assign_layouts(context_t* ctx);

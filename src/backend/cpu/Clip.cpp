@@ -84,7 +84,12 @@ struct Clip_operator : public operator_t {
         int iH = x->dims[x->ndim - 2];
         int W = x->dims[x->ndim - 1];
         int oH = y->dims[y->ndim - 2];
-        int outer = (int)(x->ndata / (iH * W));
+        // Empty spatial dims are legal in ONNX (dynamic axes); guard against
+        // divide-by-zero and widen the product to size_t so large feature
+        // maps don't silently wrap through int * int.
+        if (iH <= 0 || W <= 0) return true;
+        size_t plane = (size_t)iH * (size_t)W;
+        int outer = (int)(x->ndata / plane);
         int clamp_H = ring_out.orig_H > 0 ? ring_out.orig_H : oH;
         int out_end = std::min(out_row_start + out_rows, clamp_H);
         int count = (out_end - out_row_start) * W;

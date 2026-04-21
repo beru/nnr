@@ -26,9 +26,21 @@ struct cpu_registrar {
 
 } // namespace
 
+#ifdef NNR_ENABLE_WEBGPU
+// Forward-declared (not via header) to keep this TU free of WebGPU headers.
+// The reference below creates a link-time dependency on the WebGPU backend's
+// solve_operator.cpp, preventing MSVC dead-stripping of its webgpu_registrar
+// static — same mechanism that keeps cpu_registrar_instance alive.
+namespace webgpu { void ensure_registered(); }
+#endif
+
 operator_t* solve_operator(std::string_view op_type, int opset, pool_t& pool,
                            backend_t preferred)
 {
+#ifdef NNR_ENABLE_WEBGPU
+    if (preferred == backend_t::WEBGPU)
+        webgpu::ensure_registered();
+#endif
     return global_registry().solve(op_type, opset, pool, preferred);
 }
 

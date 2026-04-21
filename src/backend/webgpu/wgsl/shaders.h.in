@@ -1,0 +1,10 @@
+// Auto-generated at CMake configure time from every .wgsl file in this dir.
+// Do not edit — modify the source .wgsl file (or add a new one) and re-run
+// cmake. One `inline constexpr const char* <stem>` per shader.
+#pragma once
+
+namespace nnr::webgpu::wgsl {
+
+@NNR_WGSL_DECLS@
+
+} // namespace nnr::webgpu::wgsl

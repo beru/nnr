@@ -24,21 +24,33 @@ struct pool_t {
     void* alloc(size_t size, size_t align = 8)
     {
         if (size == 0) return nullptr;
-        assert(align <= BlockSize);
+        // Alignment and oversize checks must be hard runtime guards, not
+        // release-build-elided asserts: both failure modes return a pointer
+        // that a caller writes through, stomping the allocator's own state.
+        if (align > BlockSize) return nullptr;
+        constexpr size_t kMaxPayload = BlockSize - sizeof(Block);
+        if (size > kMaxPayload) return nullptr;
 
         char* body = reinterpret_cast<char*>(head_) + sizeof(Block);
         size_t off = (used_ + align - 1) & ~(align - 1);
 
-        if (off + size <= BlockSize - sizeof(Block)) {
+        if (off <= kMaxPayload && off + size <= kMaxPayload) {
             used_ = off + size;
             return body + off;
         }
 
         // Current block is full — allocate a new one.
         alloc_block();
-        assert(size <= BlockSize - sizeof(Block));
-        used_ = size;
-        return reinterpret_cast<char*>(head_) + sizeof(Block);
+        // Fresh block starts at offset 0, which is already `alignof(Block)`-
+        // aligned. Round up to the requested alignment before placing the
+        // first allocation so callers with `align > alignof(Block)` stay
+        // honored (the previous code skipped this round-up).
+        size_t start = (align > alignof(Block))
+                     ? ((alignof(Block) + align - 1) & ~(align - 1)) - alignof(Block)
+                     : 0;
+        if (start + size > kMaxPayload) return nullptr;
+        used_ = start + size;
+        return reinterpret_cast<char*>(head_) + sizeof(Block) + start;
     }
 
     template <typename T>

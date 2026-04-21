@@ -4,6 +4,7 @@
 #include "nnr.h"
 #include "util.h"
 #include "thread_pool.h"
+#include <limits>
 #ifdef NNR_ARCH_X64
 #include "backend/x64/simd_math_avx512.h"
 #include "backend/x64/ops_x64.h"
@@ -279,7 +280,25 @@ struct Div_op : public binary_arith_op_t<Div_op,
     opset_t<7, int32_t, int64_t, uint32_t, uint64_t, float16_t, float, double>>
 {
     using binary_arith_op_t::exec;
-    static auto fn(auto a, auto b) { return a / b; }
+    // Float division yields inf/NaN and stays defined; integer division
+    // by zero (and the signed INT_MIN / -1 case) is UB and on x86 raises
+    // SIGFPE. ONNX does not fully specify integer divide-by-zero, but the
+    // runtime must not crash — return 0 in those cases.
+    static auto fn(auto a, auto b) {
+        using A = decltype(a);
+        using B = decltype(b);
+        if constexpr (std::is_integral_v<A> && std::is_integral_v<B>) {
+            if (b == 0) return A(0);
+            if constexpr (std::is_signed_v<A> && std::is_signed_v<B>) {
+                // INT_MIN / -1 is UB on signed two's-complement integers.
+                if (b == B(-1) && a == std::numeric_limits<A>::min())
+                    return std::numeric_limits<A>::min();
+            }
+            return A(a / b);
+        } else {
+            return a / b;
+        }
+    }
 
     bool exec() override {
         auto* a = inputs[0]; auto* b = inputs[1]; auto* y = outputs[0];

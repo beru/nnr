@@ -85,7 +85,7 @@ struct Loop_operator : public operator_t {
             for (int i = 0; i < num_carried; ++i) {
                 if (body_input_names.size() > (size_t)(i + 2) && carried[i]) {
                     tensor_t* t = ctx->search_tensor(body_input_names[i + 2]);
-                    if (t) t->apply(*carried[i]);
+                    if (t && !t->apply(*carried[i])) return false;
                 }
             }
 
@@ -108,7 +108,9 @@ struct Loop_operator : public operator_t {
                     if (t && t->ndata > 0 && t->data) {
                         if (!carried[i])
                             carried[i] = new (std::nothrow) tensor_t("", t->type, t->dim_span());
-                        if (carried[i]) carried[i]->apply(*t);
+                        if (carried[i] && !carried[i]->allocation_failed) {
+                            if (!carried[i]->apply(*t)) return false;
+                        }
                     }
                 }
             }
@@ -126,8 +128,11 @@ struct Loop_operator : public operator_t {
         }
 
         // Write final carried variables to outputs
-        for (int i = 0; i < num_carried && i < (int)outputs.size(); ++i)
-            if (outputs[i] && carried[i]) outputs[i]->apply(*carried[i]);
+        for (int i = 0; i < num_carried && i < (int)outputs.size(); ++i) {
+            if (outputs[i] && carried[i]) {
+                if (!outputs[i]->apply(*carried[i])) return false;
+            }
+        }
 
         // Write scan outputs
         for (int i = 0; i < num_scan && (num_carried + i) < (int)outputs.size(); ++i) {

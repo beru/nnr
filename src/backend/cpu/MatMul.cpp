@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "util.h"
 #include "kernel/gemm.h"
 #include "kernel/f16_convert.h"
@@ -15,8 +16,12 @@ struct MatMul_operator : public operator_t {
     int n = 0;
     int k = 0;
     small_vector<int> batch_dims;
-    small_vector<int> a_batch_strides;
-    small_vector<int> b_batch_strides;
+    // Batch strides widened to int64 — for [1, 32, 2048, 2048] fp32 the inner
+    // batched stride is 32*2048*2048 = 134M which still fits in int, but the
+    // a_off/b_off accumulators scale with (batch_size * inner_stride) and
+    // overflow int on large attention variants or vocab×hidden embeddings.
+    small_vector<int64_t> a_batch_strides;
+    small_vector<int64_t> b_batch_strides;
 
     std::vector<float> b_packed;  // pre-packed B weights (float32)
     std::vector<uint16_t> b_packed_bf16;  // VNNI-packed BF16 weights
@@ -72,8 +77,8 @@ struct MatMul_operator : public operator_t {
         batch_dims.resize(nbatch);
         a_batch_strides.resize(nbatch);
         b_batch_strides.resize(nbatch);
-        int a_stride = m * k;  // elements per batch slice of A
-        int b_stride = k * n;  // elements per batch slice of B
+        int64_t a_stride = (int64_t)m * k;  // elements per batch slice of A
+        int64_t b_stride = (int64_t)k * n;  // elements per batch slice of B
         for (int i = nbatch - 1; i >= 0; --i) {
             batch_dims[i] = dims[i];
             // Map output batch dim i back to A's and B's dimension index
@@ -112,7 +117,7 @@ struct MatMul_operator : public operator_t {
                     float* tmp = nullptr;
                     const float* pb;
                     if (bp->type == NNR_DATA_TYPE_FLOAT16) {
-                        tmp = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                        tmp = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                         convert_f16_to_f32(tmp, (const float16_t*)bp->data, bn);
                         pb = tmp;
                     } else {
@@ -120,7 +125,7 @@ struct MatMul_operator : public operator_t {
                     }
                     b_packed.resize(psz);
                     pack_b(b_packed.data(), pb, k, n);
-                    _aligned_free(tmp);
+                    nnr_aligned_free(tmp);
                 }
             }
         }
@@ -201,12 +206,12 @@ struct MatMul_operator : public operator_t {
 
         int nbatch = batch_dims.size();
         small_vector<int> idx(nbatch);
-        int out_offset = 0;
+        int64_t out_offset = 0;
         do {
-            int a_off = 0, b_off = 0;
+            int64_t a_off = 0, b_off = 0;
             for (int i = 0; i < nbatch; ++i) {
-                a_off += idx[i] * a_batch_strides[i];
-                b_off += idx[i] * b_batch_strides[i];
+                a_off += (int64_t)idx[i] * a_batch_strides[i];
+                b_off += (int64_t)idx[i] * b_batch_strides[i];
             }
             const T* pa = pa_base + a_off;
             const T* pb = pb_base + b_off;
@@ -224,7 +229,7 @@ struct MatMul_operator : public operator_t {
                 dgemm_generic(m, n, k, pa, pb, py_slice);
             }
 
-            out_offset += m * n;
+            out_offset += (int64_t)m * n;
         } while (dim_next(idx, batch_dims));
         return true;
     }
@@ -261,12 +266,12 @@ struct MatMul_operator : public operator_t {
 
         int nbatch = batch_dims.size();
         small_vector<int> idx(nbatch);
-        int out_offset = 0;
+        int64_t out_offset = 0;
         do {
-            int a_off = 0, b_off = 0;
+            int64_t a_off = 0, b_off = 0;
             for (int i = 0; i < nbatch; ++i) {
-                a_off += idx[i] * a_batch_strides[i];
-                b_off += idx[i] * b_batch_strides[i];
+                a_off += (int64_t)idx[i] * a_batch_strides[i];
+                b_off += (int64_t)idx[i] * b_batch_strides[i];
             }
             const float* pa = a_f32 + a_off;
             float* py_slice = y_f32 + out_offset;
@@ -280,7 +285,7 @@ struct MatMul_operator : public operator_t {
                     gemm_post_t(nullptr, 0, py_slice, out_offset, this));
             }
 
-            out_offset += m * n;
+            out_offset += (int64_t)m * n;
         } while (dim_next(idx, batch_dims));
 
         // Convert output back to FP16
@@ -309,18 +314,18 @@ struct MatMul_operator : public operator_t {
             // Native VDPBF16PS path with pre-packed B
             int nbatch = batch_dims.size();
             small_vector<int> idx(nbatch);
-            int out_offset = 0;
+            int64_t out_offset = 0;
             do {
-                int a_off = 0;
+                int64_t a_off = 0;
                 for (int i = 0; i < nbatch; ++i)
-                    a_off += idx[i] * a_batch_strides[i];
+                    a_off += (int64_t)idx[i] * a_batch_strides[i];
                 const uint16_t* pa = (const uint16_t*)a->data + a_off;
                 float* py_slice = y_f32 + out_offset;
 
                 gemm_post_t post;
                 bf16::dgemm_bf16(m, n, k, pa, b_packed_bf16.data(), py_slice, post);
 
-                out_offset += m * n;
+                out_offset += (int64_t)m * n;
             } while (dim_next(idx, batch_dims));
 
             convert_f32_to_bf16((bfloat16_t*)y->data, y_f32, y_total);
@@ -337,15 +342,15 @@ struct MatMul_operator : public operator_t {
 
         int nbatch = batch_dims.size();
         small_vector<int> idx(nbatch);
-        int out_offset = 0;
+        int64_t out_offset = 0;
         do {
-            int a_off = 0, b_off = 0;
+            int64_t a_off = 0, b_off = 0;
             for (int i = 0; i < nbatch; ++i) {
-                a_off += idx[i] * a_batch_strides[i];
-                b_off += idx[i] * b_batch_strides[i];
+                a_off += (int64_t)idx[i] * a_batch_strides[i];
+                b_off += (int64_t)idx[i] * b_batch_strides[i];
             }
             dgemm_generic(m, n, k, a_f32 + a_off, b_f32 + b_off, y_f32 + out_offset);
-            out_offset += m * n;
+            out_offset += (int64_t)m * n;
         } while (dim_next(idx, batch_dims));
 
         convert_f32_to_bf16((bfloat16_t*)y->data, y_f32, y_total);
@@ -399,14 +404,14 @@ struct MatMul_operator : public operator_t {
             bf16::dgemm_bf16(actual_m, n, k, a_bf16, b_packed_bf16.data(), py, post);
         } else {
             small_vector<int> idx(nbatch);
-            int out_offset = 0;
+            int64_t out_offset = 0;
             do {
-                int a_off = 0;
+                int64_t a_off = 0;
                 for (int i = 0; i < nbatch; ++i)
-                    a_off += idx[i] * a_batch_strides[i];
+                    a_off += (int64_t)idx[i] * a_batch_strides[i];
                 bf16::dgemm_bf16(m, n, k, a_bf16 + a_off,
                     b_packed_bf16.data(), py + out_offset, post);
-                out_offset += m * n;
+                out_offset += (int64_t)m * n;
             } while (dim_next(idx, batch_dims));
         }
 

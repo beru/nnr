@@ -16,12 +16,13 @@ namespace nnr {
 // ---------------------------------------------------------------------------
 
 // Generate a tensor name from the TFLite tensor name or index.
-static std::string_view intern_name(pool_t& pool, const char* name, int idx)
+static std::string_view intern_name(pool_t& pool, std::string_view name, int idx)
 {
-    if (name && name[0]) {
-        size_t len = strlen(name);
+    if (!name.empty()) {
+        size_t len = name.size();
         char* buf = (char*)pool.alloc(len + 1, 1);
-        memcpy(buf, name, len + 1);
+        memcpy(buf, name.data(), len);
+        buf[len] = '\0';
         return {buf, len};
     }
     // Fallback: "tfl_tensor_<idx>"
@@ -134,8 +135,7 @@ static void insert_fused_activation(context_t* ctx, graph_t* graph,
 
         // Create min tensor
         tensor_t* t_min = new (std::nothrow) tensor_t("", NNR_DATA_TYPE_FLOAT32, {});
-        if (!t_min) return;
-        t_min->reinit(NNR_DATA_TYPE_FLOAT32, {});
+        if (!t_min || t_min->allocation_failed) { delete t_min; return; }
         *(float*)t_min->data = min_val;
         std::string min_name_s = std::string(producer_output->name) + "_clip_min";
         char* mn = (char*)ctx->attr_pool.alloc(min_name_s.size() + 1, 1);
@@ -147,8 +147,7 @@ static void insert_fused_activation(context_t* ctx, graph_t* graph,
 
         // Create max tensor
         tensor_t* t_max = new (std::nothrow) tensor_t("", NNR_DATA_TYPE_FLOAT32, {});
-        if (!t_max) return;
-        t_max->reinit(NNR_DATA_TYPE_FLOAT32, {});
+        if (!t_max || t_max->allocation_failed) { delete t_max; return; }
         *(float*)t_max->data = max_val;
         std::string max_name_s = std::string(producer_output->name) + "_clip_max";
         char* xn = (char*)ctx->attr_pool.alloc(max_name_s.size() + 1, 1);
@@ -465,7 +464,13 @@ static int8_t build_tflite_op_attrs(
             // Try second input first
             if (n_in >= 2 && n->inputs[1] && n->inputs[1]->ndata > 0) {
                 tensor_t* st = n->inputs[1];
-                ndims = (int)st->ndata;
+                size_t st_n = st->ndata;
+                // Reject rather than silently truncate: a shape vector longer
+                // than MAX_NDIM cannot be represented by any downstream tensor
+                // and was the vector for F-ADV-002 (OOB write into the
+                // small_vector's int8_t-sized inline storage).
+                if (st_n > (size_t)MAX_NDIM) return false;
+                ndims = (int)st_n;
                 shape_vals = small_vector<int64_t>(ndims);
                 if (st->type == NNR_DATA_TYPE_INT32) {
                     int32_t* sd = (int32_t*)st->data;
@@ -479,6 +484,7 @@ static int8_t build_tflite_op_attrs(
             if (ndims == 0 && opts) {
                 tflite::ReshapeOptions ro(opts);
                 auto ns = ro.new_shape();
+                if (ns.size() > (size_t)MAX_NDIM) return false;
                 ndims = (int)ns.size();
                 shape_vals = small_vector<int64_t>(ndims);
                 for (int d = 0; d < ndims; ++d) shape_vals[d] = ns[d];
@@ -529,6 +535,10 @@ static int8_t build_tflite_op_attrs(
             int64_t axes_nchw[MAX_NDIM] = {};
             if (n_in >= 2 && n->inputs[1] && n->inputs[1]->data) {
                 const tensor_t* axes_t = n->inputs[1];
+                // Cap axes count against the fixed-size stack buffer. Any
+                // legitimate MEAN over >MAX_NDIM axes cannot map onto a
+                // tensor_t in the first place, so reject hard.
+                if (axes_t->ndata > (size_t)MAX_NDIM) return false;
                 n_axes = (int)axes_t->ndata;
                 const int32_t* axes_data = (const int32_t*)axes_t->data;
                 int in_ndim = (n_in >= 1 && n->inputs[0]) ? n->inputs[0]->ndim : 4;
@@ -682,7 +692,7 @@ static int8_t build_tflite_op_attrs(
             // Already mapped to "Clip" — need min=0, max=6 as inputs
             // Create constant tensors
             tensor_t* t_min = new (std::nothrow) tensor_t("", NNR_DATA_TYPE_FLOAT32, {});
-            t_min->reinit(NNR_DATA_TYPE_FLOAT32, {});
+            if (!t_min || t_min->allocation_failed) { delete t_min; break; }
             *(float*)t_min->data = 0.0f;
             std::string mn_s = "relu6_min_" + std::to_string(oi);
             char* mn = (char*)ctx->attr_pool.alloc(mn_s.size() + 1, 1);
@@ -692,7 +702,7 @@ static int8_t build_tflite_op_attrs(
             ctx->initializer_names.insert(t_min->name);
 
             tensor_t* t_max = new (std::nothrow) tensor_t("", NNR_DATA_TYPE_FLOAT32, {});
-            t_max->reinit(NNR_DATA_TYPE_FLOAT32, {});
+            if (!t_max || t_max->allocation_failed) { delete t_max; break; }
             *(float*)t_max->data = 6.0f;
             std::string xn_s = "relu6_max_" + std::to_string(oi);
             char* xn = (char*)ctx->attr_pool.alloc(xn_s.size() + 1, 1);
@@ -747,8 +757,8 @@ bool load_tflite(context_t* ctx, const void* data, size_t size)
     }
 
     ctx->meta_producer_name = "tflite";
-    if (model.description())
-        ctx->meta_domain = model.description();
+    if (auto desc = model.description(); !desc.empty())
+        ctx->meta_domain = desc;
 
     // Use opset 13 as default — covers most ONNX operators we map to
     const int default_opset = 13;
@@ -793,6 +803,11 @@ bool load_tflite(context_t* ctx, const void* data, size_t size)
         // Shape (TFLite stores NHWC; we'll convert to NCHW for 4D tensors later)
         auto fshape = ft.shape();
         uint32_t ndim = fshape.size();
+        // Reject shapes that would overflow the fixed-size dims[MAX_NDIM] /
+        // strides[MAX_NDIM] members of tensor_t. Without this guard, an
+        // attacker-crafted TFLite file can drive an OOB write into
+        // small_vector's inline storage and the tensor_t stack object.
+        if (ndim > (uint32_t)MAX_NDIM) return false;
         small_vector<int> dims((int)ndim);
         for (uint32_t d = 0; d < ndim; ++d) {
             int dim_val = fshape[d];
@@ -872,8 +887,8 @@ bool load_tflite(context_t* ctx, const void* data, size_t size)
         const char* onnx_op = tflite::builtin_to_onnx(builtin_code);
         if (!onnx_op) {
             fprintf(stderr, "nnr: unsupported TFLite op: builtin_code=%d", builtin_code);
-            if (oc.custom_code())
-                fprintf(stderr, " custom=%s", oc.custom_code());
+            if (auto cc = oc.custom_code(); !cc.empty())
+                fprintf(stderr, " custom=%.*s", (int)cc.size(), cc.data());
             fprintf(stderr, "\n");
             continue;
         }

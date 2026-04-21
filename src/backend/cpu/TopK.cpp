@@ -114,7 +114,7 @@ struct TopK_operator : public operator_t {
 
         // Check if axis is the last dim (contiguous access pattern)
         bool axis_last = (caxis == ndim - 1);
-        int inner_stride = axis_last ? 1 : x->strides[caxis];
+        int64_t inner_stride = axis_last ? 1 : x->strides[caxis];
         int outer_stride_x = axis_last ? axis_dim : 1;
         int outer_stride_v = axis_last ? k : 1;
 
@@ -124,10 +124,10 @@ struct TopK_operator : public operator_t {
             std::vector<val_idx> buf(axis_dim);
 
             // Compute base offset for this slice
-            int base_x, base_v;
+            int64_t base_x, base_v;
             if (axis_last) {
-                base_x = s * axis_dim;
-                base_v = s * k;
+                base_x = (int64_t)s * axis_dim;
+                base_v = (int64_t)s * k;
             } else {
                 // General: compute offset from slice index
                 small_vector<int> outer(ndim);
@@ -170,9 +170,9 @@ struct TopK_operator : public operator_t {
             }
 
             // Write top K
-            int v_stride = axis_last ? 1 : val_out->strides[caxis];
+            int64_t v_stride = axis_last ? 1 : val_out->strides[caxis];
             for (int a = 0; a < k; ++a) {
-                int off_v = base_v + a * v_stride;
+                int64_t off_v = base_v + a * v_stride;
                 pv[off_v] = buf[a].value;
                 pi[off_v] = buf[a].index;
             }

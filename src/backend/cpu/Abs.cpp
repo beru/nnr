@@ -19,9 +19,16 @@ struct Abs_operator : public operator_t {
         T* py = (T*)y->data;
 
         for (size_t i = 0, l = y->ndata; i < l; ++i) {
-            if constexpr (std::is_signed_v<T>) {
+            if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
+                // std::abs(INT_MIN) is UB — negating the signed min value
+                // overflows. Go through the unsigned representation: the
+                // result's bit pattern equals INT_MIN, matching NumPy /
+                // ONNX reference behavior on signed overflow.
+                using U = std::make_unsigned_t<T>;
+                py[i] = (px[i] < 0) ? (T)(U(0) - (U)px[i]) : px[i];
+            } else if constexpr (std::is_signed_v<T>) {
                 py[i] = abs(px[i]);
-            }else {
+            } else {
                 py[i] = px[i];
             }
         }

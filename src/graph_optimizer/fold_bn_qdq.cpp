@@ -153,7 +153,8 @@ void fold_bn_qdq(context_t* ctx)
 
         bn->inputs[0] = uint8_in;
         bn->outputs[0] = uint8_out;
-        uint8_out->reinit(uint8_in->type, bn_out->dim_span());
+        if (!uint8_out->reinit(uint8_in->type, bn_out->dim_span()))
+            continue;
 
         // Mark DQ and Q as skip
         dq->skip = true;
@@ -247,7 +248,8 @@ void fold_bn_qdq(context_t* ctx)
         // Don't call bn->reshape() — it would overwrite uint8 type with fp32
         tensor_t* uint8_out = q->outputs[0];
         bn->outputs[0] = uint8_out;
-        uint8_out->reinit(NNR_DATA_TYPE_UINT8, bn_out->dim_span());
+        if (!uint8_out->reinit(NNR_DATA_TYPE_UINT8, bn_out->dim_span()))
+            continue;
 
         q->skip = true;
         folded_bnq++;

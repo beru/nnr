@@ -2,10 +2,11 @@
 
 #include "nnr.h"
 #include <map>
+#include <mutex>
 
 namespace nnr {
 
-enum class backend_t : uint8_t { CPU = 0, CUDA, SYCL, VULKAN };
+enum class backend_t : uint8_t { CPU = 0, CUDA, SYCL, VULKAN, WEBGPU };
 
 using resolver_fn = operator_t* (*)(int opset, pool_t& pool);
 
@@ -22,6 +23,12 @@ private:
         backend_t        backend;
         auto operator<=>(const key_t&) const = default;
     };
+    // `ops` is mutated from static-init registrars across translation units
+    // (and potentially DSOs) and read concurrently by load() threads calling
+    // solve(). Every access below holds `mtx`. Contention is negligible:
+    // register_op runs once per op at startup, solve runs once per graph
+    // node at load — never on the per-inference hot path.
+    mutable std::mutex mtx;
     std::map<key_t, resolver_fn> ops;
 };
 

@@ -1,21 +1,7 @@
 #include "arena.h"
+#include "aligned_alloc.h"
 
 #include <cstring>
-
-#ifdef _WIN32
-#  include <malloc.h>
-static void* nnr_aligned_alloc(size_t size) { return _aligned_malloc(size, 64); }
-static void  nnr_aligned_free(void* p)      { _aligned_free(p); }
-#else
-#  include <cstdlib>
-static void* nnr_aligned_alloc(size_t size)
-{
-    void* p = nullptr;
-    if (posix_memalign(&p, 64, size) != 0) p = nullptr;
-    return p;
-}
-static void nnr_aligned_free(void* p) { free(p); }
-#endif
 
 namespace nnr {
 

@@ -56,8 +56,9 @@ struct If_operator : public operator_t {
         }
         for (size_t i = 0; i < std::min(names.size(), (size_t)outputs.size()); ++i) {
             tensor_t* src = ctx->search_tensor(names[i]);
-            if (src && outputs[i] && src->data)
-                outputs[i]->apply(*src);
+            if (src && outputs[i] && src->data) {
+                if (!outputs[i]->apply(*src)) return false;
+            }
         }
         return true;
     }

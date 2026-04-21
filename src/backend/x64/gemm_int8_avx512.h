@@ -1316,7 +1316,7 @@ inline void conv_int8_packed_nr48(
         // Per-thread C accumulator sized for N-slice
         alignas(64) int32_t C_stack[MC * ((512 + 15) & ~15)];
         int32_t* C_local = (n_padded <= 528) ? C_stack
-            : (int32_t*)_aligned_malloc((size_t)MC * n_padded * sizeof(int32_t), 64);
+            : (int32_t*)nnr_aligned_alloc((size_t)MC * n_padded * sizeof(int32_t), 64);
 
         int ib = mb * MC;
         int mc = std::min(MC, spatial - ib);
@@ -1512,7 +1512,7 @@ inline void conv_int8_packed_nr48(
         } // for kb (KC blocks)
 
         if (C_local != C_stack)
-            _aligned_free(C_local);
+            nnr_aligned_free(C_local);
     });
 #endif
 }

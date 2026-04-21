@@ -70,9 +70,9 @@ struct ConstantOfShape_operator : public operator_t {
                 small_vector<int> dims((int)x->ndata);
                 for (int i = 0; i < (int)x->ndata; ++i)
                     dims[i] = (int)((const int64_t*)x->data)[i];
-                y->reinit(type, dims);
+                if (!y->reinit(type, dims)) return false;
             } else {
-                y->reinit(type, {});
+                if (!y->reinit(type, {})) return false;
             }
             char* p = (char*)y->data;
             for (size_t i = 0; i < y->ndata; ++i) {

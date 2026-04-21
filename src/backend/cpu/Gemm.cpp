@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "util.h"
 #include "allocator.h"
 #include "kernel/gemm.h"
@@ -79,7 +80,7 @@ struct Gemm_operator : public operator_t {
                 float* tmp = nullptr;
                 const float* pb;
                 if (b->type == NNR_DATA_TYPE_FLOAT16) {
-                    tmp = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                    tmp = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                     convert_f16_to_f32(tmp, (const float16_t*)b->data, bn);
                     pb = tmp;
                 } else {
@@ -88,17 +89,17 @@ struct Gemm_operator : public operator_t {
                 b_packed.resize(psz);
                 if (transB) {
                     // B is [n × k], transpose to [k × n] then pack
-                    float* bt = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                    float* bt = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                     for (int i = 0; i < n; i++)
                         for (int j = 0; j < k; j++)
                             bt[(size_t)j * n + i] = pb[(size_t)i * k + j];
                     pack_b(b_packed.data(), bt, k, n);
-                    _aligned_free(bt);
+                    nnr_aligned_free(bt);
                 } else {
                     // B is [k × n], pack directly
                     pack_b(b_packed.data(), pb, k, n);
                 }
-                _aligned_free(tmp);
+                nnr_aligned_free(tmp);
             }
         }
 
@@ -110,14 +111,14 @@ struct Gemm_operator : public operator_t {
             const uint16_t* pb = (const uint16_t*)b->data;
             if (transB) {
                 // B is [n × k], transpose to [k × n] then pack
-                uint16_t* bt = (uint16_t*)_aligned_malloc((size_t)k * n * sizeof(uint16_t), 64);
+                uint16_t* bt = (uint16_t*)nnr_aligned_alloc((size_t)k * n * sizeof(uint16_t), 64);
                 for (int i = 0; i < n; i++)
                     for (int j = 0; j < k; j++)
                         bt[(size_t)j * n + i] = pb[(size_t)i * k + j];
                 size_t psz = bf16::pack_b_bf16_size(k, n);
                 b_packed_bf16.resize(psz);
                 bf16::pack_b_bf16(b_packed_bf16.data(), bt, k, n);
-                _aligned_free(bt);
+                nnr_aligned_free(bt);
             } else {
                 size_t psz = bf16::pack_b_bf16_size(k, n);
                 b_packed_bf16.resize(psz);

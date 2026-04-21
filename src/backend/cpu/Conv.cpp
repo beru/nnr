@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "util.h"
 #include "profiler.h"
 #include "conv_shape.h"
@@ -117,8 +118,8 @@ struct Conv_operator : public operator_t {
     float* bias_f32 = nullptr;        // [M] as float32
 
     ~Conv_operator() {
-        _aligned_free(w_f32);
-        _aligned_free(bias_f32);
+        nnr_aligned_free(w_f32);
+        nnr_aligned_free(bias_f32);
     }
 
     bool init() override {

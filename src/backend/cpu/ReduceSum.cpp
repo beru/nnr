@@ -46,8 +46,13 @@ struct ReduceSum_operator : reduce_base_t {
                             red, tail);
                     });
                 } else {
-                    // Small tail: scalar with threading over batch*tail
-                    int total = batch * tail;
+                    // Small tail: scalar with threading over batch*tail.
+                    // for_static's iteration bound is int; if batch*tail overflows int
+                    // the threaded path wraps and produces garbage — fall through to
+                    // the generic reduce path below which walks the tensor with size_t.
+                    int64_t total64 = (int64_t)batch * tail;
+                    if (total64 > INT_MAX) goto scalar_fallback_x64;
+                    int total = (int)total64;
                     nnr::for_static(0, total, total > 16, [&](int bt) {
                         int b = bt / tail, t = bt % tail;
                         float sum = 0;
@@ -59,6 +64,7 @@ struct ReduceSum_operator : reduce_base_t {
                 return true;
             }
         }
+scalar_fallback_x64:;
 #elifdef NNR_ARCH_ARM64
         // NEON + threaded fast path for contiguous float ReduceSum
         if constexpr (std::is_same_v<T, float>) {
@@ -85,7 +91,9 @@ struct ReduceSum_operator : reduce_base_t {
                             red, tail);
                     });
                 } else {
-                    int total = batch * tail;
+                    int64_t total64 = (int64_t)batch * tail;
+                    if (total64 > INT_MAX) goto scalar_fallback_arm64;
+                    int total = (int)total64;
                     nnr::for_static(0, total, total > 16, [&](int bt) {
                         int b = bt / tail, t = bt % tail;
                         float sum = 0;
@@ -97,6 +105,7 @@ struct ReduceSum_operator : reduce_base_t {
                 return true;
             }
         }
+scalar_fallback_arm64:;
 #endif
         using AccT = typename acc_widen<T>::type;
         return reduce_exec_accum<T, acc_widen>(this, T(0), AccT(0),

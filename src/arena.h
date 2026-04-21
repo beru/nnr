@@ -6,7 +6,16 @@ namespace nnr {
 
 /// Bump-pointer arena allocator.
 ///
-/// All allocations remain valid until reset() or the arena is destroyed.
+/// Lifetime contract:
+///   - A pointer returned by `alloc()` is valid until the NEXT `alloc()` call
+///     that triggers growth, OR until `reset()` / destruction — whichever
+///     comes first. Callers MUST NOT hold an arena pointer across a
+///     subsequent `alloc()` unless they can prove no growth will occur
+///     (e.g. sized by `reserve()` ahead of time).
+///   - Successfully-returned pointers stay valid across allocs that fit in
+///     the current block; growth memcpys existing content into a new block
+///     and frees the old one, invalidating every prior pointer.
+///
 /// The backing block is retained across reset() calls and grows on demand
 /// (only during reshape(), never during exec()).
 ///

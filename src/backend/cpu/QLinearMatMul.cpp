@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "cpu_features.h"
 #include "util.h"
 #include <cmath>
@@ -141,15 +142,15 @@ struct QLinearMatMul_operator : public operator_t {
 
             // Temporary buffers for row sums and int32 accumulator
             int n16 = (n + 15) & ~15;  // padded ldc for NR=48 tail safety
-            int32_t* row_sums = (int32_t*)_aligned_malloc((size_t)m * sizeof(int32_t), 64);
-            int32_t* c_buf = (int32_t*)_aligned_malloc((size_t)m * n16 * sizeof(int32_t), 64);
+            int32_t* row_sums = (int32_t*)nnr_aligned_alloc((size_t)m * sizeof(int32_t), 64);
+            int32_t* c_buf = (int32_t*)nnr_aligned_alloc((size_t)m * n16 * sizeof(int32_t), 64);
 
             // Per-batch B packing (only when B varies per batch or wasn't prepacked)
             int8_t* tmp_packed = nullptr;
             int32_t* tmp_col_sums = nullptr;
             if (!b_prepacked) {
-                tmp_packed = (int8_t*)_aligned_malloc(int8::pack_b_int8_nr48_size(k, n), 64);
-                tmp_col_sums = (int32_t*)_aligned_malloc((size_t)n16 * sizeof(int32_t), 64);
+                tmp_packed = (int8_t*)nnr_aligned_alloc(int8::pack_b_int8_nr48_size(k, n), 64);
+                tmp_col_sums = (int32_t*)nnr_aligned_alloc((size_t)n16 * sizeof(int32_t), 64);
             }
 
             for (size_t i = 0, l = y->ndata; i < l; i += m * n) {
@@ -198,10 +199,10 @@ struct QLinearMatMul_operator : public operator_t {
                 }
             }
 
-            _aligned_free(row_sums);
-            _aligned_free(c_buf);
-            _aligned_free(tmp_packed);
-            _aligned_free(tmp_col_sums);
+            nnr_aligned_free(row_sums);
+            nnr_aligned_free(c_buf);
+            nnr_aligned_free(tmp_packed);
+            nnr_aligned_free(tmp_col_sums);
             return true;
         }
 #endif

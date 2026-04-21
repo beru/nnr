@@ -1,4 +1,5 @@
 #include "graph_optimizer/graph_optimizer_internal.h"
+#include "aligned_alloc.h"
 
 namespace nnr {
 
@@ -142,7 +143,8 @@ void fuse_qdq(context_t* ctx)
             if (t == consumer_output) t = q_output;
 
         // Output type and shape must match for quantized storage
-        q_output->reinit(dq_input->type, consumer_output->dim_span());
+        if (!q_output->reinit(dq_input->type, consumer_output->dim_span()))
+            continue;
 
         // Mark DQ and Q as folded (not skip).  After rewiring the consumer,
         // these nodes' I/O tensors are orphaned.  Using 'skip' would cause
@@ -157,8 +159,8 @@ void fuse_qdq(context_t* ctx)
         consumer->reshape();
         size_t ws = consumer->workspace_size();
         if (ws > ctx->workspace_size) {
-            _aligned_free(ctx->workspace);
-            ctx->workspace = _aligned_malloc(ws, 64);
+            nnr_aligned_free(ctx->workspace);
+            ctx->workspace = nnr_aligned_alloc(ws, 64);
             ctx->workspace_size = ws;
         }
 

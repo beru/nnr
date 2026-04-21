@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "refnd.h"
 #include "util.h"
 #include "kernel/conv.h"
@@ -163,7 +164,7 @@ struct ConvInteger_operator : public operator_t {
         if (inputs.size() > 3 && inputs[3]) {
             w_zp_count = (int)inputs[3]->ndata;
             if (w_zp_count > 1) {
-                w_zp_arr = (int32_t*)_aligned_malloc(w_zp_count * sizeof(int32_t), 64);
+                w_zp_arr = (int32_t*)nnr_aligned_alloc(w_zp_count * sizeof(int32_t), 64);
                 if (inputs[3]->type == NNR_DATA_TYPE_UINT8)
                     for (int i = 0; i < w_zp_count; i++) w_zp_arr[i] = ((uint8_t*)inputs[3]->data)[i];
                 else
@@ -185,7 +186,7 @@ struct ConvInteger_operator : public operator_t {
         int pH = cpads[0], pW = cpads[1];
 
         // Convert weights to float (subtract per-channel zero-point)
-        float* w_f32 = (float*)_aligned_malloc(w->ndata * sizeof(float), 64);
+        float* w_f32 = (float*)nnr_aligned_alloc(w->ndata * sizeof(float), 64);
         for (int oc = 0; oc < M; oc++) {
             int32_t wzp = w_zp_arr ? w_zp_arr[oc] : w_zp_scalar;
             size_t base = (size_t)oc * C * kH * kW;
@@ -198,7 +199,7 @@ struct ConvInteger_operator : public operator_t {
         }
 
         // Convert input to float (subtract zero-point)
-        float* x_f32 = (float*)_aligned_malloc(x->ndata * sizeof(float), 64);
+        float* x_f32 = (float*)nnr_aligned_alloc(x->ndata * sizeof(float), 64);
         if (x->type == NNR_DATA_TYPE_UINT8) {
             const uint8_t* px = (const uint8_t*)x->data;
             for (size_t i = 0; i < x->ndata; i++) x_f32[i] = (float)((int32_t)px[i] - x_zp);
@@ -207,7 +208,7 @@ struct ConvInteger_operator : public operator_t {
             for (size_t i = 0; i < x->ndata; i++) x_f32[i] = (float)((int32_t)px[i] - x_zp);
         }
 
-        float* col = (float*)_aligned_malloc((size_t)CHW * spatial * sizeof(float), 64);
+        float* col = (float*)nnr_aligned_alloc((size_t)CHW * spatial * sizeof(float), 64);
         int32_t* py = (int32_t*)y->data;
 
         for (int n = 0; n < oN; n++) {
@@ -226,10 +227,10 @@ struct ConvInteger_operator : public operator_t {
                 out[i] = (int32_t)std::nearbyint(outf[i]);
         }
 
-        _aligned_free(w_f32);
-        _aligned_free(x_f32);
-        _aligned_free(col);
-        _aligned_free(w_zp_arr);
+        nnr_aligned_free(w_f32);
+        nnr_aligned_free(x_f32);
+        nnr_aligned_free(col);
+        nnr_aligned_free(w_zp_arr);
         return true;
     }
 

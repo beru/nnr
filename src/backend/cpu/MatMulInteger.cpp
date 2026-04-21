@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "util.h"
 #ifdef NNR_ARCH_X64
 #include "backend/x64/gemm_int8_avx512.h"
@@ -108,10 +109,10 @@ struct MatMulInteger_operator : public operator_t {
             // Pack B into NR=48 VNNI format and precompute sums
             int n16 = (n + 15) & ~15;
             size_t psz = int8::pack_b_int8_nr48_size(k, n);
-            int8_t* packed = (int8_t*)_aligned_malloc(psz, 64);
-            int32_t* col_sums = (int32_t*)_aligned_malloc((size_t)n16 * sizeof(int32_t), 64);
-            int32_t* row_sums = (int32_t*)_aligned_malloc((size_t)m * sizeof(int32_t), 64);
-            int32_t* c_tmp = (int32_t*)_aligned_malloc((size_t)m * n16 * sizeof(int32_t), 64);
+            int8_t* packed = (int8_t*)nnr_aligned_alloc(psz, 64);
+            int32_t* col_sums = (int32_t*)nnr_aligned_alloc((size_t)n16 * sizeof(int32_t), 64);
+            int32_t* row_sums = (int32_t*)nnr_aligned_alloc((size_t)m * sizeof(int32_t), 64);
+            int32_t* c_tmp = (int32_t*)nnr_aligned_alloc((size_t)m * n16 * sizeof(int32_t), 64);
 
             for (size_t i = 0, l = y->ndata; i < l; i += m * n) {
                 const uint8_t* pa = (const uint8_t*)a->broadcast_map_address(y, (int)i);
@@ -129,10 +130,10 @@ struct MatMulInteger_operator : public operator_t {
                     memcpy(y_out + r * n, c_tmp + r * n16, (size_t)n * sizeof(int32_t));
             }
 
-            _aligned_free(packed);
-            _aligned_free(col_sums);
-            _aligned_free(row_sums);
-            _aligned_free(c_tmp);
+            nnr_aligned_free(packed);
+            nnr_aligned_free(col_sums);
+            nnr_aligned_free(row_sums);
+            nnr_aligned_free(c_tmp);
             return true;
         }
 #endif

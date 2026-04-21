@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cinttypes>
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "layout_cost.h"
 #include "registry.h"
+#include "backend/cpu/solve_operator.h"
 #include "graph_optimizer.h"
 #include "backend/cpu/util.h"
 #include "backend/cpu/kernel/layout.h"
@@ -14,6 +16,10 @@
 #include "thread_pool.h"
 #include "trace.h"
 #include "no_popup.h"
+#ifdef NNR_ENABLE_WEBGPU
+#include "backend/webgpu/buffer.h"
+#include "backend/webgpu/profiler.h"
+#endif
 
 #ifdef _WIN32
 #include <sys/stat.h>
@@ -101,9 +107,9 @@ int operator_t::attribute(attr_key_t key, tensor_t* t)
         tensor_t* src = a->tensor;
         if (t->type != src->type || t->ndim != src->ndim ||
             memcmp(t->dims, src->dims, src->ndim * sizeof(int)) != 0) {
-            t->reinit(src->type, src->dim_span());
+            if (!t->reinit(src->type, src->dim_span())) return 0;
         }
-        t->apply(*src);
+        if (!t->apply(*src)) return 0;
         return 1;
     }
     return 0;
@@ -163,7 +169,11 @@ inline void delete_data(void* data, data_type_t type)
 tensor_t::tensor_t(std::string_view name, data_type_t type, std::span<const int> dims)
     : name(name)
 {
-    reinit(type, dims);
+    // reinit's return is captured in the `allocation_failed` member — ctors
+    // can't propagate a bool, and callers that `new` a tensor_t check that
+    // field after construction. Ignore [[nodiscard]] warning here since the
+    // member already captures the same signal.
+    (void)reinit(type, dims);
 }
 
 tensor_t::~tensor_t()
@@ -173,7 +183,18 @@ tensor_t::~tensor_t()
     }
 }
 
-void tensor_t::reinit(data_type_t type, std::span<const int> dims)
+void tensor_t::clear_quant()
+{
+    quant_scale = 0.0f;
+    quant_zero_point = 0;
+    quant_axis = -1;
+    nnr_aligned_free(quant_scales);
+    quant_scales = nullptr;
+    nnr_aligned_free(quant_zero_points);
+    quant_zero_points = nullptr;
+}
+
+bool tensor_t::reinit(data_type_t type, std::span<const int> dims)
 {
     const int ndim = static_cast<int>(dims.size());
     size_t n;
@@ -184,12 +205,21 @@ void tensor_t::reinit(data_type_t type, std::span<const int> dims)
     if (owns_data && (ndata > 0) && data) {
         delete_data(data, this->type);
     }
+#ifdef NNR_ENABLE_WEBGPU
+    // reinit frees t->data and re-allocates at a new address/size. Any GPU
+    // residency record we built previously is now semantically stale; drop
+    // it so the next ensure_buffer rebuilds cleanly. Without this, callers
+    // had to remember to manually webgpu::mark_cpu_written(t) after reinit,
+    // which is an easy-to-miss footgun when models use dynamic shapes.
+    webgpu::forget(this);
+#endif
     data = nullptr;
     ndata = 0;
     owns_data = true;
+    allocation_failed = false;
     this->type = type;
     if (type == NNR_DATA_TYPE_UNDEFINED) {
-        return;
+        return true;
     }
     if ((ndim > 0) && !dims.empty()) {
         assert(ndim <= MAX_NDIM);
@@ -211,15 +241,17 @@ void tensor_t::reinit(data_type_t type, std::span<const int> dims)
         if (overflow) {
             data = nullptr;
             ndata = 0;
-            return;
+            allocation_failed = true;
+            return false;
         }
     }else {
         n = 1;
     }
     if (n == 0) {
+        // Valid zero-sized tensor — not a failure, just no storage.
         data = nullptr;
         ndata = 0;
-        return;
+        return true;
     }
     switch (type) {
     case NNR_DATA_TYPE_UNDEFINED: break;
@@ -252,10 +284,22 @@ void tensor_t::reinit(data_type_t type, std::span<const int> dims)
     case NNR_DATA_TYPE_SEQUENCE:
         data = new (std::nothrow) sequence_t();
         ndata = 1;
-        return;
+        if (!data) {
+            ndata = 0;
+            allocation_failed = true;
+            return false;
+        }
+        return true;
     default: break;
     }
     ndata = n;
+    if (!data) {
+        // operator new returned nullptr — ndata reflects the requested size
+        // so callers can still reason about "wanted X, got nothing".
+        allocation_failed = true;
+        return false;
+    }
+    return true;
 }
 
 void tensor_t::apply(const void* buf, size_t len)
@@ -285,7 +329,7 @@ void tensor_t::apply(const void* buf, size_t len)
     }
 }
 
-void tensor_t::apply(const tensor_t& t)
+bool tensor_t::apply(const tensor_t& t)
 {
     if (ndim != t.ndim || type != t.type || memcmp(dims, t.dims, sizeof(int) * t.ndim) != 0) {
         bool need_reinit = (type == NNR_DATA_TYPE_UNDEFINED || t.type == NNR_DATA_TYPE_UNDEFINED
@@ -295,7 +339,7 @@ void tensor_t::apply(const tensor_t& t)
             && type != NNR_DATA_TYPE_STRING && t.type != NNR_DATA_TYPE_STRING) {
             // compatible sizes, keep original type
         } else {
-            reinit(t.type, t.dim_span());
+            if (!reinit(t.type, t.dim_span())) return false;
         }
     }
     if (data && t.data && ndata > 0) {
@@ -314,13 +358,14 @@ void tensor_t::apply(const tensor_t& t)
         }
         }
     }
+    return true;
 }
 
 bool tensor_t::reshape(std::span<const int> dims, data_type_t type)
 {
     const int ndim = static_cast<int>(dims.size());
     if ((this->ndim != ndim) || (!dims.empty() && (memcmp(&this->dims[0], dims.data(), sizeof(int) * ndim) != 0)) || (this->type != type)) {
-        reinit(type, dims);
+        if (!reinit(type, dims)) return false;
     }
     return true;
 }
@@ -329,7 +374,7 @@ bool tensor_t::reshape_identity(const tensor_t* x, data_type_t type)
 {
     if (x->ndim > 0 || x->ndata > 0) {
         if ((this->ndim != x->ndim) || (memcmp(this->dims, x->dims, sizeof(int) * this->ndim) != 0) || (this->type != type)) {
-            reinit(type, x->dim_span());
+            if (!reinit(type, x->dim_span())) return false;
         }
     }
     // Propagate quantization metadata from input to output
@@ -362,12 +407,12 @@ bool tensor_t::reshape_multi_broadcast(const tensor_t* a, const tensor_t* b, dat
         }
     }
     if ((this->type != type) || (this->ndim != ndim) || (memcmp(this->dims, dims.data(), sizeof(int) * ndim) != 0)) {
-        reinit(type, dims);
+        if (!reinit(type, dims)) return false;
     }
     return true;
 }
 
-void* tensor_t::broadcast_map_address(const tensor_t* y, int offset)
+void* tensor_t::broadcast_map_address(const tensor_t* y, int64_t offset)
 {
     int xndim = this->ndim;
     int yndim = y->ndim;
@@ -407,9 +452,10 @@ void copy_data(tensor_t* y, const tensor_t* x)
         dst->elem_type = src->elem_type;
         for (const auto* t : src->tensors) {
             tensor_t* copy = new (std::nothrow) tensor_t("", t->type, t->dim_span());
-            if (copy) {
-                copy->apply(*t);
+            if (copy && !copy->allocation_failed && copy->apply(*t)) {
                 dst->tensors.push_back(copy);
+            } else {
+                delete copy;
             }
         }
     } else {
@@ -650,12 +696,20 @@ context_t::~context_t()
         planner.release();
         memory_planned = false;
     }
+#ifdef NNR_ENABLE_WEBGPU
+    // Release the WebGPU residency records keyed on these tensor pointers
+    // BEFORE delete, or the next context's tensor allocations may reuse an
+    // address and inherit a stale record (e.g. gpu_valid=true pointing at a
+    // prior run's buffer), silently skipping the upload of fresh CPU data.
+    for (auto& [key, value] : map)    webgpu::forget(value);
+    for (auto* t : attr_tensors_)     webgpu::forget(t);
+#endif
     for (auto& [key, value] : map) {
         delete value;
     }
     for (auto* t : attr_tensors_)    delete t;
     for (auto* g : attr_subgraphs_)  delete g;
-    _aligned_free(workspace);
+    nnr_aligned_free(workspace);
     if (model_free_ && model_data_) model_free_(model_data_);
     // Free mmap AFTER model_data_ — model's string_views may alias into mmap'd region
     if (mmap_free_ && mmap_data_) mmap_free_(mmap_data_);
@@ -664,11 +718,31 @@ context_t::~context_t()
 void context_t::pool_sleep() { nnr::pool_sleep(); }
 void context_t::pool_wake()  { nnr::pool_wake(); }
 
-void context_t::set_num_threads(int n) {
+void set_global_thread_count(int n) {
 #ifndef NNR_NO_THREAD_POOL
     thread_pool_t::configure(std::max(1, n));
+#else
+    (void)n;
 #endif
 }
+
+// Deprecated: forwards to set_global_thread_count. Declared [[deprecated]]
+// in the header; suppress the warning on the definition itself.
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable : 4996)
+#endif
+void context_t::set_num_threads(int n) {
+    set_global_thread_count(n);
+}
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
 
 void context_t::invalidate_shapes()
 {
@@ -783,8 +857,8 @@ bool context_t::load(const void* buf, size_t len)
 static void ensure_workspace(context_t* ctx, size_t ws)
 {
     if (ws > ctx->workspace_size) {
-        _aligned_free(ctx->workspace);
-        ctx->workspace = _aligned_malloc(ws, 64);
+        nnr_aligned_free(ctx->workspace);
+        ctx->workspace = nnr_aligned_alloc(ws, 64);
         ctx->workspace_size = ws;
     }
 }
@@ -891,6 +965,13 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
     auto& nodes = ctx->graph->nodes;
     const int num_nodes = static_cast<int>(nodes.size());
     const bool have_plan = ctx->optimizer->plan_built;
+
+#ifdef NNR_ENABLE_WEBGPU
+    // Allocate / resize the per-op timestamp QuerySet to cover this graph's
+    // node count. No-op unless NNR_WEBGPU_OP_TIMINGS is set and the device
+    // exposes TimestampQuery. See backend/webgpu/profiler.cpp.
+    nnr::webgpu::op_profiler_begin_run(num_nodes);
+#endif
 #ifdef NNR_PROFILE_REORDERS
     g_reorder_stats.inferences++;
 #endif
@@ -1031,9 +1112,22 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
             }
 
             prof.begin();
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::op_profiler_op_begin(step.node_idx);
+#endif
             { NNR_TRACE_SCOPE("op", n->op_type);
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::sync_inputs_if_cpu_op(n);
+#endif
             if (!n->exec()) return false;
-            } prof.end(step.node_idx);
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::sync_outputs_if_cpu_op(n);
+#endif
+            }
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::op_profiler_op_end(step.node_idx);
+#endif
+            prof.end(step.node_idx);
 
             // Propagate NHWC/BLOCKED_16 through layout-agnostic ops
             if (has_nhwc_input && !wants_nhwc && is_layout_all) {
@@ -1188,9 +1282,22 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
             break;
         case node_action_t::EXEC:
             prof.begin();
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::op_profiler_op_begin(i);
+#endif
             { NNR_TRACE_SCOPE("op", n->op_type);
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::sync_inputs_if_cpu_op(n);
+#endif
             if (!n->exec()) return false;
-            } prof.end(i);
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::sync_outputs_if_cpu_op(n);
+#endif
+            }
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::op_profiler_op_end(i);
+#endif
+            prof.end(i);
             if (has_nhwc_input && !wants_nhwc && n->layout_mask == LAYOUT_ALL) {
                 for (auto* t : n->outputs)
                     if (t && t->ndim == 4)
@@ -1208,11 +1315,20 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
 
 graph_output_reorder:
 
+    // Resolve output tensors once, lazily. `search_tensor` does a linear
+    // scan over `ctx->map`; caching the pointer eliminates O(|outputs| ×
+    // |map|) work on every inference.
+    if (ctx->graph_output_tensors.size() != ctx->graph_outputs.size()) {
+        ctx->graph_output_tensors.clear();
+        ctx->graph_output_tensors.reserve(ctx->graph_outputs.size());
+        for (auto& name : ctx->graph_outputs)
+            ctx->graph_output_tensors.push_back(ctx->search_tensor(name));
+    }
+
     // Reorder NHWC graph outputs to NCHW so caller always sees NCHW.
     // Internal ops may leave outputs in NHWC for efficiency, but the
     // public API contract is NCHW output.
-    for (auto& name : ctx->graph_outputs) {
-        tensor_t* t = ctx->search_tensor(name);
+    for (tensor_t* t : ctx->graph_output_tensors) {
         if (t && t->format == memory_layout_t::NHWC
             && t->ndim == 4 && t->type == NNR_DATA_TYPE_FLOAT32) {
             size_t sz = t->ndata * sizeof(float);
@@ -1236,8 +1352,7 @@ graph_output_reorder:
     }
 
     // Reorder BLOCKED_16 graph outputs to NCHW.
-    for (auto& name : ctx->graph_outputs) {
-        tensor_t* t = ctx->search_tensor(name);
+    for (tensor_t* t : ctx->graph_output_tensors) {
         if (t && t->format == NATIVE_BLOCKED_FMT && NATIVE_BLOCKED_FMT != memory_layout_t::NCHW
             && t->ndim == 4 && t->type == NNR_DATA_TYPE_FLOAT32) {
             int N = t->dims[0], C = t->dims[1], H = t->dims[2], W = t->dims[3];
@@ -1308,28 +1423,60 @@ static bool fold_run(context_t* ctx)
         // Skip fused/folded/inactive nodes — their inputs may be invalid
         if (n->skip || n->folded) continue;
         if (!n->reshape()) {
-            std::fprintf(stderr, "nnr: reshape failed: %.*s (%.*s)\n",
-                         (int)n->op_type.size(), n->op_type.data(),
-                         (int)n->node_name.size(), n->node_name.data());
-            for (size_t ii = 0; ii < n->inputs.size(); ii++) {
-                auto* t = n->inputs[ii];
-                if (!t) { std::fprintf(stderr, "  input[%zu]: null\n", ii); continue; }
-                std::fprintf(stderr, "  input[%zu]: [", ii);
-                for (int d = 0; d < t->ndim; d++) std::fprintf(stderr, "%s%d", d?",":"", t->dims[d]);
-                auto tn = data_type_tostring(t->type);
-                std::fprintf(stderr, "] %.*s%s\n",
-                    (int)tn.size(), tn.data(),
-                    t->data ? "" : " (no data)");
+            // If this op ran on a non-CPU backend, try falling back to CPU.
+            // Some reshape failures are backend-specific (WebGPU Gather
+            // rejecting int64 data, for instance, where the type is only
+            // known at reshape time because the producer is a Shape op).
+            // Replacing the op with a CPU equivalent keeps prepare() going
+            // instead of killing the whole graph.
+            bool fell_back = false;
+            if (n->resolved_backend != static_cast<uint8_t>(backend_t::CPU)) {
+                operator_t* cpu_n = solve_operator(n->op_type, n->opset,
+                                                   ctx->attr_pool, backend_t::CPU);
+                if (cpu_n) {
+                    cpu_n->ctx       = ctx;
+                    cpu_n->opset     = n->opset;
+                    cpu_n->op_type   = n->op_type;
+                    cpu_n->node_name = n->node_name;
+                    cpu_n->domain    = n->domain;
+                    cpu_n->inputs    = n->inputs;
+                    cpu_n->outputs   = n->outputs;
+                    cpu_n->attrs     = n->attrs;
+                    if (cpu_n->init() && cpu_n->reshape()) {
+                        // Swap in place; preserves iteration order.
+                        for (size_t ni = 0; ni < nodes.size(); ++ni) {
+                            if (nodes[ni] == n) { nodes[ni] = cpu_n; n = cpu_n; break; }
+                        }
+                        fell_back = true;
+                    }
+                }
             }
-            for (size_t ii = 0; ii < n->outputs.size(); ii++) {
-                auto* t = n->outputs[ii];
-                if (!t) continue;
-                std::fprintf(stderr, "  output[%zu]: [", ii);
-                for (int d = 0; d < t->ndim; d++) std::fprintf(stderr, "%s%d", d?",":"", t->dims[d]);
-                auto tn = data_type_tostring(t->type);
-                std::fprintf(stderr, "] %.*s\n", (int)tn.size(), tn.data());
+            if (fell_back) {
+                // Fall through to post-reshape steps below.
+            } else {
+                std::fprintf(stderr, "nnr: reshape failed: %.*s (%.*s)\n",
+                             (int)n->op_type.size(), n->op_type.data(),
+                             (int)n->node_name.size(), n->node_name.data());
+                for (size_t ii = 0; ii < n->inputs.size(); ii++) {
+                    auto* t = n->inputs[ii];
+                    if (!t) { std::fprintf(stderr, "  input[%zu]: null\n", ii); continue; }
+                    std::fprintf(stderr, "  input[%zu]: [", ii);
+                    for (int d = 0; d < t->ndim; d++) std::fprintf(stderr, "%s%d", d?",":"", t->dims[d]);
+                    auto tn = data_type_tostring(t->type);
+                    std::fprintf(stderr, "] %.*s%s\n",
+                        (int)tn.size(), tn.data(),
+                        t->data ? "" : " (no data)");
+                }
+                for (size_t ii = 0; ii < n->outputs.size(); ii++) {
+                    auto* t = n->outputs[ii];
+                    if (!t) continue;
+                    std::fprintf(stderr, "  output[%zu]: [", ii);
+                    for (int d = 0; d < t->ndim; d++) std::fprintf(stderr, "%s%d", d?",":"", t->dims[d]);
+                    auto tn = data_type_tostring(t->type);
+                    std::fprintf(stderr, "] %.*s\n", (int)tn.size(), tn.data());
+                }
+                return false;
             }
-            return false;
         }
         size_t ws = n->workspace_size();
         if (ws > ctx->workspace_size)
@@ -1421,6 +1568,11 @@ bool context_t::run_for_warmup()
             if (t && !t->data && t->type != NNR_DATA_TYPE_UNDEFINED) { safe = false; break; }
         if (safe) n->exec();
     }
+#ifdef NNR_ENABLE_WEBGPU
+    // Flush any WebGPU dispatches queued during warmup so subsequent
+    // scroll-timing trials see populated tensor data, not pending work.
+    nnr::webgpu::flush_encoder();
+#endif
     return true;
 }
 
@@ -1456,7 +1608,11 @@ bool context_t::run()
         }
     }
 
-    if (memory_planned)
+    // Zero the activation pool only the first time after (re)allocation.
+    // Operators write every cell of their output before reading it, so
+    // stale bytes from a previous run are overwritten; blanket-memset on
+    // every run was the memory-bandwidth cost flagged by F-PHP-001.
+    if (memory_planned && !planner.is_pool_zeroed())
         planner.zero_pool();
 
     if (!run_graph(this))
@@ -1478,6 +1634,22 @@ bool context_t::run()
         planner.apply();
         memory_planned = true;
     }
+
+#ifdef NNR_ENABLE_WEBGPU
+    // Submit any WebGPU dispatches still pending in the shared encoder.
+    // Without this, ops that don't trigger a CPU download (e.g. when no
+    // CPU op consumes their output and the user doesn't read the graph
+    // output mid-loop) would silently not run until the next download —
+    // breaking timing measurements and benchmark semantics. No-op when
+    // no encoder is active (CPU-only graphs, or already flushed by a
+    // boundary download).
+    //
+    // When per-op profiling is active, append ResolveQuerySet + readback
+    // copy commands before the flush submits, then map+read after.
+    nnr::webgpu::op_profiler_pre_flush();
+    nnr::webgpu::flush_encoder();
+    nnr::webgpu::op_profiler_post_flush();
+#endif
 
     return true;
 }

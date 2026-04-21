@@ -71,7 +71,14 @@ void onnx_tensor_copy_from_proto(tensor_t* t, const onnx_pb::TensorProto& o)
     size_t sz = data_type_sizeof(t->type);
     if (sz <= 0) return;
 
-    if (!o.raw_data.empty()) {
+    // ONNX spec forbids raw_data for STRING tensors. If a malicious model
+    // sets it anyway, treating raw_data as a blob and memcpy'ing over
+    // `std::string` objects overwrites their internal SSO pointers / flags
+    // — subsequent destruction invokes arbitrary frees. Fall through to
+    // string_data instead.
+    const bool raw_valid_for_type = !o.raw_data.empty() &&
+                                    t->type != NNR_DATA_TYPE_STRING;
+    if (raw_valid_for_type) {
         const uint8_t* src = (const uint8_t*)o.raw_data.data();
         size_t len = o.raw_data.size();
 #ifdef NNR_LITTLE_ENDIAN
@@ -265,9 +272,37 @@ static bool onnx_tensor_load_external(tensor_t* t, const onnx_pb::TensorProto& o
 
     if (location.empty()) return false;
 
+    // Reject path-traversal and absolute paths. `location` is attacker-
+    // controlled and is concatenated with `model_dir`; without this guard,
+    // values like "../../../etc/passwd" or "/etc/passwd" / "C:\..." resolve
+    // into arbitrary files on the host.
+    auto has_traversal = [](std::string_view s) {
+        if (s.empty()) return true;
+        if (s.find("..") != std::string_view::npos) return true;
+        if (s.front() == '/' || s.front() == '\\') return true;
+        // Reject Windows drive-letter absolute paths like "C:\..." or "C:/...".
+        if (s.size() >= 2 && s[1] == ':') return true;
+        return false;
+    };
+    if (has_traversal(location)) {
+        std::fprintf(stderr, "nnr: rejecting external-data location with "
+                             "path traversal: %.*s\n",
+                     (int)location.size(), location.data());
+        return false;
+    }
+
     std::string path = model_dir + std::string(location);
     size_t elem_size = data_type_sizeof(t->type);
-    size_t byte_count = (length > 0) ? (size_t)length : t->ndata * elem_size;
+    // Compute the maximum number of bytes the destination tensor can receive
+    // safely (ndata * elem_size, saturating on overflow). `length` from the
+    // model is attacker-controlled; clamp it to that ceiling so a malicious
+    // oversized value cannot drive `ReadFile`/`fread` past the heap buffer.
+    size_t tensor_cap = (elem_size && t->ndata <= SIZE_MAX / elem_size)
+                      ? t->ndata * elem_size
+                      : SIZE_MAX;
+    size_t byte_count = (length > 0) ? (size_t)length : tensor_cap;
+    if (byte_count > tensor_cap) byte_count = tensor_cap;
+    if (offset < 0) return false;
 
 #ifdef _WIN32
     HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -648,9 +683,39 @@ static bool onnx_build_graph(context_t* ctx, graph_t* graph, const onnx_pb::Grap
             n->attrs = std::span<std::pair<attr_key_t, attr_t>>(abuf, n_valid_attrs);
         }
 
-        if (!n->init())
-            std::fprintf(stderr, "nnr: op init failed: %.*s (opset %d)\n",
-                         (int)np.op_type.size(), np.op_type.data(), default_opset);
+        if (!n->init()) {
+            // Fall back to the CPU backend if the preferred backend's init
+            // rejects this op/opset/shape combination (e.g. WebGPU Pad
+            // requires opset ≥ 11; opset-9 Pad reads pads from attributes
+            // and only CPU handles that path). Without this, onnx_loader
+            // leaves a broken op in the graph and prepare()'s reshape()
+            // fails. The fallback only kicks in when a non-CPU backend
+            // already picked an op; CPU init failures are hard errors.
+            bool fell_back = false;
+            if (n->resolved_backend != static_cast<uint8_t>(backend_t::CPU)) {
+                operator_t* cpu_n = solve_operator(np.op_type, default_opset,
+                                                   ctx->attr_pool, backend_t::CPU);
+                if (cpu_n) {
+                    cpu_n->ctx       = ctx;
+                    cpu_n->opset     = default_opset;
+                    cpu_n->op_type   = np.op_type;
+                    cpu_n->node_name = np.name;
+                    cpu_n->domain    = domain;
+                    cpu_n->inputs    = n->inputs;
+                    cpu_n->outputs   = n->outputs;
+                    cpu_n->attrs     = n->attrs;
+                    if (cpu_n->init()) {
+                        graph->nodes[i] = cpu_n;
+                        n = cpu_n;
+                        fell_back = true;
+                    }
+                }
+            }
+            if (!fell_back) {
+                std::fprintf(stderr, "nnr: op init failed: %.*s (opset %d)\n",
+                             (int)np.op_type.size(), np.op_type.data(), default_opset);
+            }
+        }
     }
     return true;
 }
