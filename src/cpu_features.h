@@ -21,6 +21,33 @@
 
 #include "cache_topology.h"
 
+#if defined(NNR_ARCH_ARM64) && defined(_WIN32)
+// Forward-declare to avoid pulling in the full <windows.h>. The real symbol lives in kernel32
+// and is exported as an import entry, hence __declspec(dllimport) to match the SDK header.
+extern "C" __declspec(dllimport) int __stdcall IsProcessorFeaturePresent(unsigned long ProcessorFeature);
+#  ifndef PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
+#    define PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE 43
+#  endif
+#endif
+
+#if defined(NNR_ARCH_ARM64) && defined(__linux__)
+#  include <sys/auxv.h>
+#  include <asm/hwcap.h>
+// Older kernel headers may be missing newer HWCAP2 bits; define defensively.
+#  ifndef HWCAP_ASIMDHP
+#    define HWCAP_ASIMDHP  (1 << 10)
+#  endif
+#  ifndef HWCAP_ASIMDDP
+#    define HWCAP_ASIMDDP  (1 << 20)
+#  endif
+#  ifndef HWCAP2_I8MM
+#    define HWCAP2_I8MM    (1 << 13)
+#  endif
+#  ifndef HWCAP2_BF16
+#    define HWCAP2_BF16    (1 << 14)
+#  endif
+#endif
+
 namespace nnr {
 
 struct cpu_features_t {
@@ -55,7 +82,11 @@ struct cpu_features_t {
     bool monitorx = false;  // AMD MONITORX/MWAITX
 
     // ARM
-    bool neon = false;      // NEON SIMD (mandatory on AArch64)
+    bool neon    = false;   // NEON SIMD (mandatory on AArch64)
+    bool fp16    = false;   // ARMv8.2-A FP16 arithmetic (vfmaq_f16 etc.)
+    bool dotprod = false;   // ARMv8.4-A SDOT/UDOT (int8 dot-product)
+    bool i8mm    = false;   // ARMv8.6-A SMMLA/UMMLA/USMMLA (int8 matrix-multiply)
+    bool bf16    = false;   // ARMv8.6-A BFDOT/BFMMLA (bf16 dot-product)
 
     // Cache topology (sizes in KB; 0 means "unknown"). Callers that derive
     // workspace/tile budgets MUST substitute a safe fallback when these are
@@ -137,6 +168,28 @@ inline const cpu_features_t& cpu_features() {
 #elifdef NNR_ARCH_ARM64
         // NEON is mandatory on AArch64 — always present.
         f.neon = true;
+  #ifdef _WIN32
+        // Windows-on-ARM exposes dotprod via IsProcessorFeaturePresent(43).
+        f.dotprod = IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) != 0;
+        // i8mm/bf16/fp16 have no universal Windows probe as of 2026-04; detect via SEH illegal-instruction
+        // probe (see arm_feature_probe.h). For MVP, conservatively assume these track dotprod on
+        // Oryon-class chips — Oryon Gen 1 has all of dotprod/i8mm/bf16/fp16. Refine when other ARM
+        // Windows chips appear without this grouping.
+        if (f.dotprod) {
+            f.fp16 = true;
+            f.i8mm = true;
+            f.bf16 = true;
+        }
+  #elif defined(__linux__)
+        // Linux/Android: per-feature detection via ELF auxiliary vector HWCAP bits.
+        unsigned long hwcap  = getauxval(AT_HWCAP);
+        unsigned long hwcap2 = getauxval(AT_HWCAP2);
+        // Scalar FP16 is FPHP; vector FP16 (the one we care about for vfmaq_f16 etc.) is ASIMDHP.
+        f.fp16    = (hwcap  & HWCAP_ASIMDHP) != 0;
+        f.dotprod = (hwcap  & HWCAP_ASIMDDP) != 0;
+        f.i8mm    = (hwcap2 & HWCAP2_I8MM)   != 0;
+        f.bf16    = (hwcap2 & HWCAP2_BF16)   != 0;
+  #endif
 #endif
 
         // Cache topology detection (OS API; fallback to conservative defaults).
@@ -200,6 +253,40 @@ inline bool has_avx512_bf16() {
 inline bool has_neon() {
 #ifdef NNR_ARCH_ARM64
     return max_isa() >= isa_t::neon;
+#else
+    return false;
+#endif
+}
+
+// ARM ISA extensions beyond base NEON. Runtime-gated via cpu_features().
+// Always false on non-ARM (compile-time constant).
+inline bool has_neon_fp16() {
+#ifdef NNR_ARCH_ARM64
+    return has_neon() && cpu_features().fp16;
+#else
+    return false;
+#endif
+}
+
+inline bool has_neon_dotprod() {
+#ifdef NNR_ARCH_ARM64
+    return has_neon() && cpu_features().dotprod;
+#else
+    return false;
+#endif
+}
+
+inline bool has_neon_i8mm() {
+#ifdef NNR_ARCH_ARM64
+    return has_neon() && cpu_features().i8mm;
+#else
+    return false;
+#endif
+}
+
+inline bool has_neon_bf16() {
+#ifdef NNR_ARCH_ARM64
+    return has_neon() && cpu_features().bf16;
 #else
     return false;
 #endif

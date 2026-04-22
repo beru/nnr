@@ -95,6 +95,7 @@ struct Attention_operator : public operator_t {
         const tensor_t* mask_in = (inputs.size() > 3 && inputs[3] && inputs[3]->ndata > 0) ? inputs[3] : nullptr;
         const tensor_t* past_key = (inputs.size() > 4 && inputs[4] && inputs[4]->ndata > 0) ? inputs[4] : nullptr;
         const tensor_t* past_value = (inputs.size() > 5 && inputs[5] && inputs[5]->ndata > 0) ? inputs[5] : nullptr;
+        const tensor_t* nonpad_kv_seqlen_in = (inputs.size() > 6 && inputs[6] && inputs[6]->ndata > 0) ? inputs[6] : nullptr;
         tensor_t* Y = outputs[0];
         tensor_t* qk_out = (outputs.size() > 3 && outputs[3] && outputs[3]->ndata > 0) ? outputs[3] : nullptr;
         int qk_mode = qk_matmul_output_mode;
@@ -121,18 +122,31 @@ struct Attention_operator : public operator_t {
         // Build full key/value with past concatenation
         int total_kv_seq = seq_kv;
         int past_seq = 0;
-        T* full_key = nullptr;
-        T* full_value = nullptr;
+        if (past_key) {
+            past_seq = past_key->dims[2];
+            total_kv_seq = past_seq + seq_kv;
+        }
+        int kv_seq = total_kv_seq;
+
+        // All scratch comes from a single arena allocation: arena_t::alloc grows
+        // by copy-and-free, so any later alloc invalidates every pointer returned
+        // earlier in this exec. One call up front avoids that hazard entirely.
+        size_t n_fk = past_key ? (size_t)batch * kvh * total_kv_seq * kd : 0;
+        size_t n_fv = past_key ? (size_t)batch * kvh * total_kv_seq * vd : 0;
+        size_t t_bytes = (n_fk + n_fv) * sizeof(T);
+        size_t t_doubles = (t_bytes + sizeof(double) - 1) / sizeof(double);
+        double* block = scope.alloc_arr<double>(t_doubles + (size_t)kv_seq);
+
+        T* full_key = past_key ? (T*)block : nullptr;
+        T* full_value = past_key ? full_key + n_fk : nullptr;
+        double* scores = block + t_doubles;
+
         const T* key_ptr = pK;
         const T* val_ptr = pV;
         int key_stride_batch, key_stride_head, key_stride_seq;
         int val_stride_batch, val_stride_head, val_stride_seq;
 
         if (past_key) {
-            past_seq = past_key->dims[2];
-            total_kv_seq = past_seq + seq_kv;
-            full_key = scope.alloc_arr<T>(batch * kvh * total_kv_seq * kd);
-            full_value = scope.alloc_arr<T>(batch * kvh * total_kv_seq * vd);
             const T* ppk = (const T*)past_key->data;
             const T* ppv = past_value ? (const T*)past_value->data : nullptr;
 
@@ -201,14 +215,11 @@ struct Attention_operator : public operator_t {
             val_stride_seq = kvh * vd;
         }
 
-        int kv_seq = total_kv_seq;
         float sc = scale;
         if (sc == 0.0f) sc = 1.0f / std::sqrt((float)qd);
         int gqa_ratio = qh / kvh;
 
         bool mask_is_bool = mask_in && mask_in->type == NNR_DATA_TYPE_BOOL;
-
-        double* scores = scope.alloc_arr<double>(kv_seq);
         T* pQK = qk_out ? (T*)qk_out->data : nullptr;
 
         for (int b = 0; b < batch; ++b) {
@@ -238,11 +249,16 @@ struct Attention_operator : public operator_t {
                         for (int sk = 0; sk < kv_seq; ++sk)
                             pQK[qk_idx + sk] = (T)scores[sk];
                     }
-                    // Apply attention mask (additive bias)
+                    // Apply attention mask (additive bias). The mask's innermost dim may be
+                    // smaller than kv_seq when nonpad_kv_seqlen is used to signal padded kv
+                    // positions; clamp the sk bound to the mask's last dim to avoid OOB.
+                    int mask_sk_bound = mask_in
+                        ? std::min(kv_seq, mask_in->dims[mask_in->ndim - 1])
+                        : 0;
                     if (mask_in) {
                         if (mask_is_bool) {
                             const uint8_t* pm_bool = (const uint8_t*)mask_in->data;
-                            for (int sk = 0; sk < kv_seq; ++sk) {
+                            for (int sk = 0; sk < mask_sk_bound; ++sk) {
                                 int mi;
                                 if (mask_in->ndim == 2) {
                                     mi = sq * mask_in->dims[1] + sk;
@@ -259,7 +275,7 @@ struct Attention_operator : public operator_t {
                             }
                         } else {
                             const T* pM = (const T*)mask_in->data;
-                            for (int sk = 0; sk < kv_seq; ++sk) {
+                            for (int sk = 0; sk < mask_sk_bound; ++sk) {
                                 int mi;
                                 if (mask_in->ndim == 2) {
                                     mi = sq * mask_in->dims[1] + sk;
@@ -297,6 +313,17 @@ struct Attention_operator : public operator_t {
                             if (sk > offset + sq)
                                 scores[sk] = -std::numeric_limits<double>::infinity();
                         }
+                    }
+
+                    // Apply padding mask from nonpad_kv_seqlen (input[6]): positions past the
+                    // per-batch non-padded length are kv padding and never contribute.
+                    if (nonpad_kv_seqlen_in) {
+                        const int64_t* nonpad = (const int64_t*)nonpad_kv_seqlen_in->data;
+                        int len = (int)nonpad[b];
+                        if (len < 0) len = 0;
+                        if (len > kv_seq) len = kv_seq;
+                        for (int sk = len; sk < kv_seq; ++sk)
+                            scores[sk] = -std::numeric_limits<double>::infinity();
                     }
 
                     // Write qk_matmul_output mode 1: after scale + mask + causal

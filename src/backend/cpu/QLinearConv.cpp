@@ -14,6 +14,11 @@
 #include "backend/x64/conv_first_layer_int8_avx512.h"
 #include "backend/x64/depthwise_int8_avx512.h"
 #include "backend/x64/transpose_nchw_nhwc_u8.h"
+#elifdef NNR_ARCH_ARM64
+#include "backend/arm/gemm_int8_neon.h"
+#include "backend/arm/conv_int8_direct_neon.h"
+#include "backend/arm/conv_int8_nhwc_direct_neon.h"
+#include "backend/arm/depthwise_int8_neon.h"
 #endif
 
 namespace nnr {
@@ -45,6 +50,12 @@ struct QLinearConv_operator : public operator_t {
     // Direct int8 conv (VNNI, no im2col)
     std::vector<int8_t> w_direct_buf;    // VNNI-packed weights for direct conv
     std::vector<int32_t> w_direct_sums;  // per-OC weight sums for zero-point compensation
+#ifdef NNR_ARCH_ARM64
+    // Separate SMMLA-packed weights for the NHWC i8mm fast path. SMMLA uses a
+    // different tile layout (2-OC × 8-IC) than the SDOT pack above, so both
+    // coexist when has_neon_i8mm() — SDOT still services the NCHW exec path.
+    std::vector<int8_t> w_direct_smmla_buf;
+#endif
 
     // First-layer int8 direct conv (IC<=4, e.g. RGB stem): [KH, KW, OC_blocks, 16, 4]
     std::vector<int8_t> w_first_layer_int8;      // VNNI-packed first-layer weights
@@ -701,6 +712,259 @@ struct QLinearConv_operator : public operator_t {
 
 #endif
 
+#ifdef NNR_ARCH_ARM64
+    // NEON depthwise int8 exec — indirection-based (no direct-addressing variant yet on ARM).
+    // Parallel to exec_dw_int8_nhwc (x64) but uses the `_neon` suffixed pack/build/compute
+    // functions and C_pad = 4-aligned (vs 16-aligned on AVX-512).
+    template <typename T>
+    bool exec_dw_int8_nhwc_neon(const qlinear4d_vars_t<T>& v) {
+        if constexpr (!std::is_same_v<T, uint8_t>) { (void)v; return false; }
+        else {
+            if (w_dw_repacked.empty()) return false;
+            if (v.y->format != memory_layout_t::NHWC) return false;
+            if (v.per_channel_zp) return false;
+            if (!has_neon_dotprod()) return false;
+
+            int32_t w_zp_scalar = (v.w_zp_count > 0) ? (int32_t)v.w_zp_data[0] : 0;
+            int kHW = v.kH * v.kW;
+
+            std::memset(dw_zero_buf.data(), (uint8_t)v.x_zp, dw_zero_buf.size());
+
+            float qmin_f = (float)v.qmin;
+            float qmax_f = (float)v.clamp_max;
+
+            for (int n = 0; n < v.oN; n++) {
+                const uint8_t* x_nhwc;
+                if (v.x->format == memory_layout_t::NHWC) {
+                    x_nhwc = (const uint8_t*)v.x->data + (size_t)n * v.iH * v.iW * v.iC;
+                } else {
+                    if (x_pad_nhwc_buf.empty())
+                        x_pad_nhwc_buf.resize((size_t)v.iH * v.iW * v.iC + 64);
+                    uint8_t* buf = (uint8_t*)(((uintptr_t)x_pad_nhwc_buf.data() + 63) & ~63);
+                    for (int ic = 0; ic < v.iC; ic++) {
+                        const uint8_t* src = (const uint8_t*)v.x->data
+                            + ((size_t)n * v.iC + ic) * v.iH * v.iW;
+                        for (int h = 0; h < v.iH; h++)
+                            for (int ww = 0; ww < v.iW; ww++)
+                                buf[((size_t)h * v.iW + ww) * v.iC + ic] = src[h * v.iW + ww];
+                    }
+                    x_nhwc = buf;
+                }
+
+                int8::neon::build_depthwise_indirection_neon(
+                    dw_ind_buf.data(), x_nhwc, dw_zero_buf.data(),
+                    v.oH, v.oW, v.iH, v.iW, v.iC,
+                    v.kH, v.kW, v.sH, v.sW, v.pH, v.pW, v.dH, v.dW);
+
+                T* py = (T*)v.y->data + (size_t)n * v.spatial * v.M;
+                int8::neon::depthwise_int8_nhwc_neon_mt(
+                    (uint8_t*)py, dw_ind_buf.data(),
+                    w_dw_repacked.data(),
+                    rq_combined_scales.data(),
+                    rq_bias_f.empty() ? nullptr : rq_bias_f.data(),
+                    v.iC, v.oH, v.oW, kHW,
+                    (int)v.x_zp, w_zp_scalar,
+                    v.inv_y_scale, (float)v.y_zp, qmin_f, qmax_f);
+            }
+            v.y->format = memory_layout_t::NHWC;
+            return true;
+        }
+    }
+
+    // NEON SDOT direct int8 conv. Parallel to exec_direct_int8 (x64) — same w_direct_buf/
+    // w_direct_sums buffers, but packed via the ARM-specific layout in reshape.
+    // On i8mm-capable chips, prefers the SMMLA path (conv_int8_direct_nchw_smmla), which
+    // pre-transposes the NCHW activation to NHWC in a scratch buffer and runs the SMMLA
+    // body with NCHW-layout stores — typically 3-4× faster than the SDOT path at C=64 56×56.
+    template <typename T>
+    bool exec_direct_int8_neon(const qlinear4d_vars_t<T>& v) {
+        if constexpr (!std::is_same_v<T, uint8_t>) { (void)v; return false; }
+        else {
+            if (w_direct_buf.empty()) return false;
+            if (v.per_channel_zp) return false;
+            if (v.w_zp_count != 0 && (int32_t)v.w_zp_data[0] != 0) return false;
+            if (v.spatial > 256) return false;
+            if (v.y->format == memory_layout_t::NHWC) return false;
+            if (!has_neon_dotprod()) return false;
+
+  #if defined(__ARM_FEATURE_MATMUL_INT8) || (defined(_MSC_VER) && defined(_M_ARM64))
+            const bool use_smmla = !w_direct_smmla_buf.empty() && has_neon_i8mm();
+  #else
+            const bool use_smmla = false;
+  #endif
+
+            int IC4 = (v.iC + 3) / 4;
+            int IC_padded = IC4 * 4;  // x_pad stays NCHW-padded to IC4; SMMLA path internally
+                                      // extends to IC8 inside its scratch buffer.
+            int padded_H = v.iH + v.pH + cpads[2];
+            int padded_W = v.iW + v.pW + cpads[3];
+            size_t pad_plane = (size_t)padded_H * padded_W;
+
+            std::vector<uint8_t> x_pad_vec((size_t)IC_padded * pad_plane);
+            std::vector<int32_t> y_i32_vec((size_t)v.M * v.spatial);
+            std::vector<uint8_t> x_nhwc_scratch;
+  #if defined(__ARM_FEATURE_MATMUL_INT8) || (defined(_MSC_VER) && defined(_M_ARM64))
+            if (use_smmla) {
+                x_nhwc_scratch.resize(
+                    conv_int8_direct_nchw_smmla_x_scratch_size(v.iC, padded_H, padded_W));
+            }
+  #endif
+            uint8_t* x_pad = x_pad_vec.data();
+            int32_t* y_i32 = y_i32_vec.data();
+
+            for (int n = 0; n < v.oN; n++) {
+                std::memset(x_pad, (uint8_t)v.x_zp, (size_t)IC_padded * pad_plane);
+                for (int ic = 0; ic < v.iC; ic++) {
+                    const uint8_t* src = (const uint8_t*)v.x->data
+                        + ((size_t)n * v.iC + ic) * v.iH * v.iW;
+                    uint8_t* dst = x_pad + (size_t)ic * pad_plane
+                        + v.pH * padded_W + v.pW;
+                    for (int h = 0; h < v.iH; h++)
+                        std::memcpy(dst + h * padded_W, src + h * v.iW, v.iW);
+                }
+
+  #if defined(__ARM_FEATURE_MATMUL_INT8) || (defined(_MSC_VER) && defined(_M_ARM64))
+                if (use_smmla) {
+                    conv_int8_direct_nchw_smmla(y_i32, x_pad,
+                        w_direct_smmla_buf.data(), w_direct_sums.data(),
+                        v.iC, padded_H, padded_W, v.M, v.oH, v.oW,
+                        v.kH, v.kW, v.sH, v.sW,
+                        (uint8_t)v.x_zp, x_nhwc_scratch.data());
+                } else
+  #endif
+                conv_int8_direct_neon(y_i32, x_pad, w_direct_buf.data(),
+                    w_direct_sums.data(),
+                    v.iC, padded_H, padded_W, v.M, v.oH, v.oW,
+                    v.kH, v.kW, v.sH, v.sW);
+
+                // Zero-point compensation + requantize (scalar — NEON requantize is a follow-up).
+                T* out_n = (T*)v.y->data + (size_t)n * v.M * v.spatial;
+                for (int oc = 0; oc < v.M; oc++) {
+                    float ws = v.per_channel_scale ? v.w_scale_data[oc] : v.w_scale_data[0];
+                    float combined_scale = v.x_scale * ws;
+                    float bias_val = v.pbias ? (float)v.pbias[oc] * combined_scale : 0.0f;
+                    int32_t zp_comp = (int32_t)v.x_zp * w_direct_sums[oc];
+                    int32_t* irow = y_i32 + (size_t)oc * v.spatial;
+                    T* out = out_n + (size_t)oc * v.spatial;
+                    for (int s = 0; s < v.spatial; s++) {
+                        int32_t raw_val = irow[s] - zp_comp;
+                        float val = (float)raw_val * combined_scale + bias_val;
+                        int32_t q = (int32_t)std::nearbyint(val * v.inv_y_scale) + (int32_t)v.y_zp;
+                        out[s] = (T)std::clamp(q, v.qmin, v.clamp_max);
+                    }
+                }
+            }
+            return true;
+        }
+    }
+
+    // NEON direct int8 conv (NHWC output). Mirrors exec_direct_int8_neon but
+    // reads/writes NHWC tensors. Picks the SMMLA (i8mm) pack when
+    // w_direct_smmla_buf is non-empty, falling back to the SDOT pack.
+    template <typename T>
+    bool exec_direct_int8_nhwc_neon(const qlinear4d_vars_t<T>& v) {
+        if constexpr (!std::is_same_v<T, uint8_t>) { (void)v; return false; }
+        else {
+            if (w_direct_buf.empty()) return false;
+            if (v.per_channel_zp) return false;
+            if (v.w_zp_count != 0 && (int32_t)v.w_zp_data[0] != 0) return false;
+            if (v.y->format != memory_layout_t::NHWC) return false;
+            if (group != 1) return false;
+            if (v.spatial > 256) return false;
+            if (!has_neon_dotprod()) return false;
+
+  #if defined(__ARM_FEATURE_MATMUL_INT8) || (defined(_MSC_VER) && defined(_M_ARM64))
+            const bool use_smmla = !w_direct_smmla_buf.empty() && has_neon_i8mm();
+  #else
+            const bool use_smmla = false;
+  #endif
+            // SMMLA needs IC padded to 8, SDOT to 4. Pick the pad that matches.
+            const int IC_block = use_smmla ? 8 : 4;
+            const int IC_padded = ((v.iC + IC_block - 1) / IC_block) * IC_block;
+            const int padded_H = v.iH + v.pH + cpads[2];
+            const int padded_W = v.iW + v.pW + cpads[3];
+
+            std::vector<uint8_t> x_pad_vec((size_t)padded_H * padded_W * IC_padded);
+            std::vector<int32_t> y_i32_vec((size_t)v.oH * v.oW * v.M);
+            uint8_t* x_pad = x_pad_vec.data();
+            int32_t* y_i32 = y_i32_vec.data();
+
+            for (int n = 0; n < v.oN; n++) {
+                std::memset(x_pad, (uint8_t)v.x_zp,
+                    (size_t)padded_H * padded_W * IC_padded);
+
+                if (v.x->format == memory_layout_t::NHWC) {
+                    const uint8_t* src_n = (const uint8_t*)v.x->data
+                        + (size_t)n * v.iH * v.iW * v.iC;
+                    for (int h = 0; h < v.iH; h++) {
+                        uint8_t* drow = x_pad
+                            + ((size_t)(h + v.pH) * padded_W + v.pW) * IC_padded;
+                        const uint8_t* srow = src_n + (size_t)h * v.iW * v.iC;
+                        for (int ww = 0; ww < v.iW; ww++)
+                            std::memcpy(drow + (size_t)ww * IC_padded,
+                                        srow + (size_t)ww * v.iC, v.iC);
+                    }
+                } else {
+                    // NCHW → NHWC transpose into the padded buffer.
+                    const uint8_t* src_n = (const uint8_t*)v.x->data
+                        + (size_t)n * v.iC * v.iH * v.iW;
+                    for (int ic = 0; ic < v.iC; ic++) {
+                        const uint8_t* ch = src_n + (size_t)ic * v.iH * v.iW;
+                        for (int h = 0; h < v.iH; h++) {
+                            const uint8_t* srow = ch + (size_t)h * v.iW;
+                            uint8_t* drow = x_pad
+                                + ((size_t)(h + v.pH) * padded_W + v.pW) * IC_padded
+                                + ic;
+                            for (int ww = 0; ww < v.iW; ww++)
+                                drow[(size_t)ww * IC_padded] = srow[ww];
+                        }
+                    }
+                }
+
+                bool ok;
+  #if defined(__ARM_FEATURE_MATMUL_INT8) || (defined(_MSC_VER) && defined(_M_ARM64))
+                if (use_smmla) {
+                    ok = conv_int8_direct_nhwc_smmla(
+                        y_i32, x_pad, w_direct_smmla_buf.data(), w_direct_sums.data(),
+                        v.iC, padded_H, padded_W,
+                        v.M, v.oH, v.oW,
+                        v.kH, v.kW, v.sH, v.sW);
+                } else
+  #endif
+                {
+                    ok = conv_int8_direct_nhwc_neon(
+                        y_i32, x_pad, w_direct_buf.data(), w_direct_sums.data(),
+                        v.iC, padded_H, padded_W,
+                        v.M, v.oH, v.oW,
+                        v.kH, v.kW, v.sH, v.sW);
+                }
+                if (!ok) return false;
+
+                T* out_n = (T*)v.y->data + (size_t)n * v.oH * v.oW * v.M;
+                for (int oh = 0; oh < v.oH; oh++) {
+                    for (int ow = 0; ow < v.oW; ow++) {
+                        const int32_t* yp = y_i32
+                            + ((size_t)oh * v.oW + ow) * v.M;
+                        T* out = out_n + ((size_t)oh * v.oW + ow) * v.M;
+                        for (int oc = 0; oc < v.M; oc++) {
+                            float ws = v.per_channel_scale ? v.w_scale_data[oc] : v.w_scale_data[0];
+                            float combined_scale = v.x_scale * ws;
+                            float bias_val = v.pbias ? (float)v.pbias[oc] * combined_scale : 0.0f;
+                            int32_t zp_comp = (int32_t)v.x_zp * w_direct_sums[oc];
+                            int32_t raw_val = yp[oc] - zp_comp;
+                            float val = (float)raw_val * combined_scale + bias_val;
+                            int32_t q = (int32_t)std::nearbyint(val * v.inv_y_scale) + (int32_t)v.y_zp;
+                            out[oc] = (T)std::clamp(q, v.qmin, v.clamp_max);
+                        }
+                    }
+                }
+            }
+            v.y->format = memory_layout_t::NHWC;
+            return true;
+        }
+    }
+#endif
+
 #ifdef NNR_ARCH_X64
     template <typename T>
     bool exec_packed_nr48(const qlinear4d_vars_t<T>& v) {
@@ -1346,6 +1610,10 @@ struct QLinearConv_operator : public operator_t {
         if (exec_packed_nr48<T>(v))   return true;
         if (exec_gather_gemm<T>(v))   return true;
         if (exec_vnni_im2col<T>(v))   return true;
+#elifdef NNR_ARCH_ARM64
+        if (exec_dw_int8_nhwc_neon<T>(v))    return true;
+        if (exec_direct_int8_nhwc_neon<T>(v)) return true;
+        if (exec_direct_int8_neon<T>(v)) return true;
 #endif
         return exec_float_fallback<T>(v);
     }

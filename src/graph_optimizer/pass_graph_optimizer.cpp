@@ -179,6 +179,20 @@ struct fuse_silu_pass_t : pass_t {
     bool         once()  const override { return true; }
 };
 
+struct fuse_sdpa_pass_t : pass_t {
+    bool apply(graph_optimizer_t& opt, context_t* ctx) override
+    {
+        if (!opt.fusion_enabled) return false;
+        fuse_sdpa(ctx);
+        return false;
+    }
+    const char*  name()  const override { return "fuse_sdpa"; }
+    // FUSION (not PREPROCESS): needs shape inference to have run so
+    // q_tensor->dims[...] is populated for the shape-compatibility checks.
+    pass_level_t level() const override { return pass_level_t::FUSION; }
+    bool         once()  const override { return true; }
+};
+
 struct fold_bn_qdq_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
@@ -346,6 +360,7 @@ struct pass_graph_optimizer_t : graph_optimizer_t {
         mgr_.add(std::make_unique<fold_constants_pass_t>());
         mgr_.add(std::make_unique<fuse_qdq_compute_pass_t>());
         mgr_.add(std::make_unique<fuse_qdq_pass_t>());
+        mgr_.add(std::make_unique<fuse_sdpa_pass_t>());
         mgr_.add(std::make_unique<fuse_post_ops_pass_t>());
 
         // LAYOUT and SCHEDULING are registered by the arch-specific subclass
@@ -371,7 +386,6 @@ struct pass_graph_optimizer_t : graph_optimizer_t {
                 if (!n->skip && !n->folded && n->op_type == "AveragePool")
                     n->init();
             }
-            // fuse_sdpa(ctx);  // TODO: needs non-threaded GEMM to avoid deadlock
         }
         preprocess_done = true;
     }

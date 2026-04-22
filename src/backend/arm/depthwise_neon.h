@@ -183,19 +183,22 @@ inline bool depthwise_2d(
                     float32x4_t a2 = vdupq_n_f32(0);
                     for (int kw = 0; kw < 3; ++kw) {
                         int iw = iw0 + kw;
+                        // Row pointers have -pW baked in, so the contiguous 4-wide load from
+                        // r*+iw covers actual columns [iw-pW, iw-pW+3]; bounds check them directly.
+                        int iw_in = iw - pW;
                         float32x4_t w0 = vdupq_n_f32(wc[0 + kw]);
                         float32x4_t w1 = vdupq_n_f32(wc[3 + kw]);
                         float32x4_t w2 = vdupq_n_f32(wc[6 + kw]);
-                        if (iw >= 0 && iw + 3 < iW) {
+                        if (iw_in >= 0 && iw_in + 3 < iW) {
                             a0 = vfmaq_f32(a0, w0, vld1q_f32(r0 + iw));
                             a1 = vfmaq_f32(a1, w1, vld1q_f32(r1 + iw));
                             a2 = vfmaq_f32(a2, w2, vld1q_f32(r2 + iw));
                         } else {
                             alignas(16) float t0[4] = {}, t1[4] = {}, t2[4] = {};
                             for (int p = 0; p < 4; ++p) {
-                                int iwp = iw + p;
+                                int iwp = iw_in + p;
                                 if (iwp >= 0 && iwp < iW) {
-                                    t0[p] = r0[iwp]; t1[p] = r1[iwp]; t2[p] = r2[iwp];
+                                    t0[p] = r0[iw + p]; t1[p] = r1[iw + p]; t2[p] = r2[iw + p];
                                 }
                             }
                             a0 = vfmaq_f32(a0, w0, vld1q_f32(t0));

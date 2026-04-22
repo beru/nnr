@@ -22,6 +22,9 @@
 #include "backend/arm/conv_direct_neon_inline.h"
 #include "backend/arm/depthwise_nhwc_neon.h"
 #include "backend/arm/depthwise_nchwc_neon.h"
+#include "backend/arm/conv_fp16_direct_neon.h"
+#include "backend/arm/conv_fp16_nhwc_direct_neon.h"
+#include "backend/arm/depthwise_fp16_neon.h"
 #ifdef NNR_USE_XBYAK_AARCH64
 #include "backend/arm/jit_gemm_driver.h"
 #endif
@@ -115,6 +118,19 @@ struct Conv_operator : public operator_t {
     // FP16 I/O: pre-converted float32 weights and bias (populated in reshape)
     float* w_f32 = nullptr;           // [M, kC, kH, kW] as float32
     float* bias_f32 = nullptr;        // [M] as float32
+#ifdef NNR_ARCH_ARM64
+    // FP16 native NCHW direct conv (has_neon_fp16): pre-packed FP16 weights
+    // in the `conv_fp16_direct_neon.h` layout.  When populated, the FP16
+    // trampoline picks the native path in preference to convert-to-FP32.
+    std::vector<uint16_t> w_fp16_direct;
+    // FP16 native NHWC direct conv: pre-packed FP16 weights in the
+    // `conv_fp16_nhwc_direct_neon.h` layout. Selected at exec time when
+    // x->format is NHWC; otherwise w_fp16_direct (NCHW) wins.
+    std::vector<uint16_t> w_fp16_nhwc_direct;
+    // FP16 native NHWC depthwise conv: repacked FP16 depthwise weights in
+    // [kH*kW, C] layout for depthwise_fp16_nhwc_neon.
+    std::vector<uint16_t> w_fp16_dw_nhwc;
+#endif
 
     ~Conv_operator() {
         _aligned_free(w_f32);

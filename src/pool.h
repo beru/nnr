@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cassert>
 #include <new>
+#include <utility>
 
 namespace nnr {
 

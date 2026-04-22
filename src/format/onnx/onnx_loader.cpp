@@ -640,7 +640,8 @@ static bool onnx_build_graph(context_t* ctx, graph_t* graph, const onnx_pb::Grap
                 // Convert ONNX data type integers to NNR data_type_t at load time
                 if (abuf[idx].second.kind == attr_t::kind_t::INT &&
                     (key == attr_key_t::to || key == attr_key_t::dtype ||
-                     key == attr_key_t::output_datatype)) {
+                     key == attr_key_t::output_datatype ||
+                     key == attr_key_t::output_dtype)) {
                     abuf[idx].second.i = onnx_to_nnr_dtype((int32_t)abuf[idx].second.i);
                 }
                 ++idx;

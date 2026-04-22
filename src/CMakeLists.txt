@@ -21,6 +21,8 @@ add_library(nnr
 	${SRC_FILES}
 )
 
+target_include_directories(nnr PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
+
 set_directory_properties(PROPERTIES COMPILE_DEFINITIONS "")
 
 if(WIN32)
@@ -78,8 +80,22 @@ if(MSVC)
 	add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 	target_compile_options(nnr PRIVATE /MP)
 	target_compile_options(nnr PRIVATE /Zc:preprocessor)
-	if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+	if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64" OR CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64")
+		# armv8.6 enables dotprod (SDOT/UDOT), fp16 arith, i8mm (SMMLA), bf16 (BFDOT) intrinsics.
+		# Runtime CPU-feature gating still protects execution on older ARM chips.
+		target_compile_options(nnr PUBLIC /arch:armv8.6)
+	else()
 		target_compile_options(nnr PRIVATE /arch:AVX2)
 	endif()
 	target_link_libraries(nnr PUBLIC synchronization)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+	# Pi 5 is the ARM execution floor: ARMv8.2-A + dotprod (SDOT/UDOT) + fp16 arithmetic.
+	# We also declare +i8mm at compile time so kernels that explicitly use SMMLA/UMMLA
+	# intrinsics can compile; those kernels MUST be runtime-gated via has_neon_i8mm()
+	# so the resulting binary never executes i8mm instructions on Pi 5. The compiler
+	# does not spontaneously auto-vectorize scalar code with SMMLA (it's a 2×2×8 matrix
+	# instruction, no common scalar pattern matches it), so this flag is safe for Pi 5.
+	# +fp16fml enables `vfmlalq_{low,high,lane_low,lane_high}_f16` (FP16 widening FMAs).
+	# Cortex-A76 (Pi 5) and both Oryon generations include FHM/FP16FML; safe by default.
+	target_compile_options(nnr PUBLIC -march=armv8.2-a+dotprod+fp16+fp16fml+i8mm)
 endif()

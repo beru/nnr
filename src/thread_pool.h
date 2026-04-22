@@ -17,6 +17,7 @@
 // are pulled in and no worker threads are created.
 
 #include "cpu_features.h"  // always needed (defines NNR_ARCH_X64 / NNR_ARCH_ARM64)
+#include "nnrconf.h"       // _aligned_malloc/_aligned_free polyfill on non-Windows
 
 #ifndef NNR_NO_THREAD_POOL // full multi-threaded implementation below
 

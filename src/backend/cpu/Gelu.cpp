@@ -2,8 +2,11 @@
 #include "nnr.h"
 #include "util.h"
 #include "cpu_features.h"
+#include "thread_pool.h"
 #ifdef NNR_ARCH_X64
 #include "backend/x64/simd_math_avx512.h"
+#elifdef NNR_ARCH_ARM64
+#include "backend/arm/simd_math_neon.h"
 #endif
 
 namespace nnr {
@@ -56,6 +59,19 @@ struct Gelu_operator : public operator_t {
             gelu_avx512((const float*)inputs[0]->data,
                         (float*)outputs[0]->data, outputs[0]->ndata);
             return true;
+        }
+#elifdef NNR_ARCH_ARM64
+        if (!approximate) {
+            if (inputs[0]->type == NNR_DATA_TYPE_FLOAT32) {
+                gelu_neon((const float*)inputs[0]->data,
+                          (float*)outputs[0]->data, outputs[0]->ndata);
+                return true;
+            }
+            if (inputs[0]->type == NNR_DATA_TYPE_FLOAT16 && has_neon_fp16()) {
+                gelu_neon_fp16((const uint16_t*)inputs[0]->data,
+                               (uint16_t*)outputs[0]->data, outputs[0]->ndata);
+                return true;
+            }
         }
 #endif
         return typed_exec<Gelu_operator,

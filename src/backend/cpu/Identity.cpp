@@ -19,6 +19,9 @@ struct Identity_operator : public operator_t {
 
     bool exec() override {
         data_type_t type = inputs[0]->type;
+        // Empty optional (no element present): Identity is a no-op.
+        if (type == NNR_DATA_TYPE_UNDEFINED && inputs[0]->ndata == 0)
+            return true;
         // SEQUENCE and other non-tensor types: always use copy_data
         if (type == NNR_DATA_TYPE_SEQUENCE) {
             return exec_impl();

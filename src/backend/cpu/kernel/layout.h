@@ -305,6 +305,42 @@ inline void reorder_inplace(float* data, int N, int C, int H, int W,
         nhwc_to_nchw(data, temp, N, C, H, W);
 }
 
+// Element-size-generic in-place NHWC↔NCHW reorder for non-float tensor types
+// (uint8 quantized outputs, float16, etc.). Scalar; intended for the once-per-run
+// graph-output reorder, not for hot-path tile transposes.
+// temp must hold at least N*C*H*W*elem_size bytes.
+inline void reorder_inplace_bytes(void* data, int N, int C, int H, int W,
+    memory_layout_t from, memory_layout_t to, void* temp, size_t elem_size)
+{
+    if (from == to) return;
+    const size_t count = (size_t)N * C * H * W;
+    memcpy(temp, data, count * elem_size);
+    auto* dst = (uint8_t*)data;
+    const auto* src = (const uint8_t*)temp;
+    const int HW = H * W;
+    if (from == memory_layout_t::NHWC && to == memory_layout_t::NCHW) {
+        for (int n = 0; n < N; n++) {
+            const uint8_t* src_n = src + (size_t)n * HW * C * elem_size;
+            uint8_t*       dst_n = dst + (size_t)n * C * HW * elem_size;
+            for (int c = 0; c < C; c++)
+                for (int hw = 0; hw < HW; hw++)
+                    memcpy(dst_n + ((size_t)c * HW + hw) * elem_size,
+                           src_n + ((size_t)hw * C + c) * elem_size,
+                           elem_size);
+        }
+    } else if (from == memory_layout_t::NCHW && to == memory_layout_t::NHWC) {
+        for (int n = 0; n < N; n++) {
+            const uint8_t* src_n = src + (size_t)n * C * HW * elem_size;
+            uint8_t*       dst_n = dst + (size_t)n * HW * C * elem_size;
+            for (int c = 0; c < C; c++)
+                for (int hw = 0; hw < HW; hw++)
+                    memcpy(dst_n + ((size_t)hw * C + c) * elem_size,
+                           src_n + ((size_t)c * HW + hw) * elem_size,
+                           elem_size);
+        }
+    }
+}
+
 // Transpose weight matrix [M x C] -> [C x M] for NHWC 1x1 Conv.
 inline void transpose_weights(float* __restrict dst, const float* __restrict src,
     int M, int C)

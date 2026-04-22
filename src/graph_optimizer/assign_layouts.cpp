@@ -265,6 +265,7 @@ void assign_layouts(context_t* ctx)
             auto* nd = nodes[entry.node_idx];
             for (auto* t : nd->outputs) {
                 if (t && t->ndim == 4 && (t->type == NNR_DATA_TYPE_FLOAT32
+                    || t->type == NNR_DATA_TYPE_FLOAT16
                     || t->type == NNR_DATA_TYPE_UINT8 || t->type == NNR_DATA_TYPE_INT8)) {
                     t->format = memory_layout_t::NHWC;
                     ctx->optimizer->nhwc_tensors.push_back(t);

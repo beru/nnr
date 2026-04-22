@@ -135,11 +135,11 @@ struct Sigmoid_operator : public operator_t {
                 return x * s;
             });
         } else {
-            foreach_tensor<T>([](auto x){
+            foreach_tensor<T>([](auto x) -> T {
                 if (x >= 0) {
-                    return (T)1.0 / ((T)1.0 + (T)exp(-1 * x));
+                    return (T)((T)1.0 / ((T)1.0 + (T)exp(-1 * x)));
                 } else {
-                    return exp(x) / ((T)1.0 + (T)exp(x));
+                    return (T)(exp(x) / ((T)1.0 + (T)exp(x)));
                 }
             });
         }

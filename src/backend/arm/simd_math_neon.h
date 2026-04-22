@@ -70,6 +70,55 @@ static inline float32x4_t silu_neon_ps(float32x4_t x) {
     return vmulq_f32(x, sigmoid_neon_ps(x));
 }
 
+// Fast erf(x) for 4 floats using NEON.
+// Abramowitz & Stegun 7.1.26 (5-term polynomial × exp(-x²)). Max error ~1.5e-7.
+//   t = 1 / (1 + p*|x|)
+//   erf(x) = sign(x) * (1 - (a1·t + a2·t² + a3·t³ + a4·t⁴ + a5·t⁵) · exp(-x²))
+// @nnr-meta isa=NEON dtype=fp32
+static inline float32x4_t erf_neon_ps(float32x4_t x) {
+    const uint32x4_t sign_mask = vdupq_n_u32(0x80000000u);
+    uint32x4_t sign = vandq_u32(vreinterpretq_u32_f32(x), sign_mask);
+    float32x4_t ax = vabsq_f32(x);
+
+    const float32x4_t p  = vdupq_n_f32(0.3275911f);
+    const float32x4_t a1 = vdupq_n_f32(0.254829592f);
+    const float32x4_t a2 = vdupq_n_f32(-0.284496736f);
+    const float32x4_t a3 = vdupq_n_f32(1.421413741f);
+    const float32x4_t a4 = vdupq_n_f32(-1.453152027f);
+    const float32x4_t a5 = vdupq_n_f32(1.061405429f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+
+    // t = 1 / (1 + p*|x|) via rcpe + two Newton steps (~24-bit precision)
+    float32x4_t denom = vfmaq_f32(one, p, ax);
+    float32x4_t t = vrecpeq_f32(denom);
+    t = vmulq_f32(t, vrecpsq_f32(denom, t));
+    t = vmulq_f32(t, vrecpsq_f32(denom, t));
+
+    // Horner: ((((a5·t + a4)·t + a3)·t + a2)·t + a1)·t
+    float32x4_t poly = vfmaq_f32(a4, a5, t);
+    poly = vfmaq_f32(a3, poly, t);
+    poly = vfmaq_f32(a2, poly, t);
+    poly = vfmaq_f32(a1, poly, t);
+    poly = vmulq_f32(poly, t);
+
+    // exp(-x²)
+    float32x4_t ex = exp_neon_ps(vnegq_f32(vmulq_f32(ax, ax)));
+
+    // 1 - poly·exp(-x²), then re-apply sign
+    float32x4_t r = vfmsq_f32(one, poly, ex);
+    return vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(r), sign));
+}
+
+// GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+// @nnr-meta isa=NEON dtype=fp32
+static inline float32x4_t gelu_neon_ps(float32x4_t x) {
+    const float32x4_t inv_sqrt2 = vdupq_n_f32(0.7071067811865476f);
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    float32x4_t e = erf_neon_ps(vmulq_f32(x, inv_sqrt2));
+    return vmulq_f32(vmulq_f32(half, x), vaddq_f32(one, e));
+}
+
 // Apply sigmoid to a contiguous float array (threaded, NEON).
 // @nnr-meta isa=NEON dtype=fp32
 inline void sigmoid_neon(float* data, size_t n) {
@@ -103,6 +152,64 @@ inline void silu_neon(const float* src, float* dst, size_t n) {
         }
         for (; i < end; i++)
             dst[i] = src[i] / (1.0f + expf(-src[i]));
+    });
+}
+
+// Apply GELU (exact, erf-based): dst[i] = 0.5 * x * (1 + erf(x / sqrt(2))) (threaded, NEON).
+// @nnr-meta isa=NEON dtype=fp32
+inline void gelu_neon(const float* src, float* dst, size_t n) {
+    constexpr size_t CHUNK = 16384;
+    int nchunks = (int)((n + CHUNK - 1) / CHUNK);
+    nnr::for_static(0, nchunks, nchunks > 1, [&](int c) {
+        size_t start = (size_t)c * CHUNK;
+        size_t end = std::min(start + CHUNK, n);
+        size_t i = start;
+        for (; i + 4 <= end; i += 4) {
+            float32x4_t v = vld1q_f32(src + i);
+            vst1q_f32(dst + i, gelu_neon_ps(v));
+        }
+        const float inv_sqrt2_s = 0.7071067811865476f;
+        for (; i < end; i++)
+            dst[i] = 0.5f * src[i] * (1.0f + std::erf(src[i] * inv_sqrt2_s));
+    });
+}
+
+// Apply GELU to FP16 array: widen to FP32, compute, narrow back (threaded, NEON).
+// External layout is uint16_t bit-pattern for FP16 (NNR convention).
+// @nnr-meta isa=NEON dtype=fp16
+inline void gelu_neon_fp16(const uint16_t* src, uint16_t* dst, size_t n) {
+    constexpr size_t CHUNK = 16384;
+    int nchunks = (int)((n + CHUNK - 1) / CHUNK);
+    nnr::for_static(0, nchunks, nchunks > 1, [&](int c) {
+        size_t start = (size_t)c * CHUNK;
+        size_t end = std::min(start + CHUNK, n);
+        size_t i = start;
+        for (; i + 8 <= end; i += 8) {
+            float16x8_t vh = vreinterpretq_f16_u16(vld1q_u16(src + i));
+            float32x4_t lo = vcvt_f32_f16(vget_low_f16(vh));
+            float32x4_t hi = vcvt_f32_f16(vget_high_f16(vh));
+            float16x4_t glo = vcvt_f16_f32(gelu_neon_ps(lo));
+            float16x4_t ghi = vcvt_f16_f32(gelu_neon_ps(hi));
+            vst1q_u16(dst + i, vreinterpretq_u16_f16(vcombine_f16(glo, ghi)));
+        }
+        if (i < end) {
+            // 4-lane tail via widen→compute→narrow.
+            for (; i + 4 <= end; i += 4) {
+                float16x4_t h = vreinterpret_f16_u16(vld1_u16(src + i));
+                float32x4_t f = vcvt_f32_f16(h);
+                float16x4_t g = vcvt_f16_f32(gelu_neon_ps(f));
+                vst1_u16(dst + i, vreinterpret_u16_f16(g));
+            }
+            // 1..3 leftover via single-lane convert.
+            const float inv_sqrt2_s = 0.7071067811865476f;
+            for (; i < end; i++) {
+                float16x4_t h1 = vreinterpret_f16_u16(vdup_n_u16(src[i]));
+                float f = vgetq_lane_f32(vcvt_f32_f16(h1), 0);
+                float g = 0.5f * f * (1.0f + std::erf(f * inv_sqrt2_s));
+                float16x4_t gh = vcvt_f16_f32(vdupq_n_f32(g));
+                dst[i] = vget_lane_u16(vreinterpret_u16_f16(gh), 0);
+            }
+        }
     });
 }
 

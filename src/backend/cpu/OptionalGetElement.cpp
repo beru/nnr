@@ -24,7 +24,8 @@ struct OptionalGetElement_operator : public operator_t {
     {
         tensor_t* x = inputs[0];
         tensor_t* y = outputs[0];
-        if (!x || x->type == NNR_DATA_TYPE_UNDEFINED) return false;
+        // Empty optional (no element present): produce an empty output.
+        if (!x || x->type == NNR_DATA_TYPE_UNDEFINED) return true;
         if (x->type == NNR_DATA_TYPE_SEQUENCE) {
             const sequence_t* src = tensor_get_sequence(x);
             sequence_t* dst = tensor_get_sequence(y);

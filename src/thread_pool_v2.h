@@ -32,6 +32,7 @@
 //   - SMT-stride-aware tid_to_processor (physical cores first).
 
 #include "cpu_features.h"
+#include "nnrconf.h"  // Provides _aligned_malloc/_aligned_free polyfill on non-Windows.
 
 #include <atomic>
 #include <thread>

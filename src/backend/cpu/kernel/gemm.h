@@ -18,6 +18,7 @@
 #include "backend/arm/vec_ops_neon.h"
 #include "backend/arm/gemm_neon.h"
 #include "backend/arm/conv_neon.h"
+#include "backend/arm/gemm_fp16_neon.h"
 #endif
 
 namespace nnr {
@@ -347,6 +348,42 @@ inline void dgemm_packed_b(int n, int m, int o, const float* A, const float* pac
     if (has_neon())
         neon::dgemm_packed_b(n, m, o, A, packed_B, C, post_fn);
 #endif
+}
+
+// FP16 GEMM with pre-packed B. FP16 inputs (uint16_t bit pattern), FP32 output.
+// Caller is responsible for any FP32→FP16 conversion of C. Returns false when
+// no FP16 hardware path is available; the caller should then fall back to the
+// convert-to-FP32 path.
+inline size_t pack_b_fp16_size(int o, int m) {
+#ifdef NNR_ARCH_ARM64
+    if (has_neon_fp16())
+        return nnr::fp16::neon::pack_b_fp16_neon_size(o, m);
+#else
+    (void)o; (void)m;
+#endif
+    return 0;
+}
+
+inline void pack_b_fp16(uint16_t* dst, const uint16_t* B, int o, int m) {
+    NNR_PROFILE_SCOPE("pack_b_fp16");
+#ifdef NNR_ARCH_ARM64
+    if (has_neon_fp16())
+        nnr::fp16::neon::pack_b_fp16_neon(dst, B, o, m);
+#else
+    (void)dst; (void)B; (void)o; (void)m;
+#endif
+}
+
+inline bool dgemm_fp16(int n, int m, int o,
+                      const uint16_t* A, const uint16_t* packed_B, float* C) {
+    NNR_PROFILE_SCOPE("dgemm_fp16");
+#ifdef NNR_ARCH_ARM64
+    if (has_neon_fp16())
+        return nnr::fp16::neon::gemm_fp16_neon(n, m, o, A, packed_B, C);
+#else
+    (void)n; (void)m; (void)o; (void)A; (void)packed_B; (void)C;
+#endif
+    return false;
 }
 
 // NHWC-native GEMM with pre-packed B. packed_B must be created by pack_b().

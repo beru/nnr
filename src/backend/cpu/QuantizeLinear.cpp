@@ -14,20 +14,26 @@ namespace {
 
 struct QuantizeLinear_operator : public operator_t {
     int axis = 1;
+    int block_size = 0;
+    data_type_t output_dtype = NNR_DATA_TYPE_UNDEFINED;
 
     bool init() override {
         if (inputs.size() < 2 || outputs.size() != 1)
             return false;
         axis = attribute(attr_key_t::axis, (int32_t)1);
+        block_size = attribute(attr_key_t::block_size, (int32_t)0);
+        output_dtype = (data_type_t)attribute(attr_key_t::output_dtype, (int32_t)NNR_DATA_TYPE_UNDEFINED);
         layout_mask = LAYOUT_ALL;  // element-wise, layout-agnostic
         return true;
     }
 
     bool reshape() override {
-        // Determine output type from zero_point if present, else uint8
+        // Output type priority: zero_point (if present) > output_dtype attr > uint8.
         data_type_t out_type = NNR_DATA_TYPE_UINT8;
         if (inputs.size() > 2 && inputs[2] && inputs[2]->ndata > 0) {
             out_type = inputs[2]->type;
+        } else if (output_dtype != NNR_DATA_TYPE_UNDEFINED) {
+            out_type = output_dtype;
         }
         return outputs[0]->reshape_identity(inputs[0], out_type);
     }
@@ -202,6 +208,71 @@ struct QuantizeLinear_operator : public operator_t {
                 int16_t* py = (int16_t*)y->data;
                 for (size_t i = 0; i < x->ndata; ++i)
                     py[i] = (int16_t)std::clamp((int)std::nearbyint(px[i] / scale) + zero, -32768, 32767);
+            }
+            return true;
+        }
+
+        // Blocked quantization: y_scale has the same ndim as x, with dims[axis]
+        // reduced by block_size. Scales/zero-points are broadcast over each
+        // block of block_size contiguous elements along `axis`.
+        if (block_size > 0 && y_scale->ndim == x->ndim
+            && y_scale->dims[caxis] * block_size == x->dims[caxis]) {
+            const float* scales = (const float*)y_scale->data;
+            const float* px = (const float*)x->data;
+            const int ndim = x->ndim;
+            int scale_strides[MAX_NDIM];
+            scale_strides[ndim - 1] = 1;
+            for (int d = ndim - 2; d >= 0; --d)
+                scale_strides[d] = scale_strides[d + 1] * y_scale->dims[d + 1];
+
+            int x_idx[MAX_NDIM] = {0};
+            auto advance = [&]() {
+                for (int d = ndim - 1; d >= 0; --d) {
+                    if (++x_idx[d] < x->dims[d]) return;
+                    x_idx[d] = 0;
+                }
+            };
+            auto scale_idx = [&]() {
+                int s = 0;
+                for (int d = 0; d < ndim; ++d) {
+                    int c = (d == caxis) ? (x_idx[d] / block_size) : x_idx[d];
+                    s += c * scale_strides[d];
+                }
+                return s;
+            };
+
+            if (y->type == NNR_DATA_TYPE_UINT8) {
+                const uint8_t* zeros = y_zero ? (const uint8_t*)y_zero->data : nullptr;
+                uint8_t* py = (uint8_t*)y->data;
+                for (size_t i = 0; i < x->ndata; ++i, advance()) {
+                    int si = scale_idx();
+                    uint8_t z = zeros ? zeros[si] : 0;
+                    py[i] = (uint8_t)std::clamp((int)std::nearbyint(px[i] / scales[si]) + z, 0, 255);
+                }
+            } else if (y->type == NNR_DATA_TYPE_INT8) {
+                const int8_t* zeros = y_zero ? (const int8_t*)y_zero->data : nullptr;
+                int8_t* py = (int8_t*)y->data;
+                for (size_t i = 0; i < x->ndata; ++i, advance()) {
+                    int si = scale_idx();
+                    int8_t z = zeros ? zeros[si] : 0;
+                    py[i] = (int8_t)std::clamp((int)std::nearbyint(px[i] / scales[si]) + z, -128, 127);
+                }
+            } else if (y->type == NNR_DATA_TYPE_UINT16) {
+                const uint16_t* zeros = y_zero ? (const uint16_t*)y_zero->data : nullptr;
+                uint16_t* py = (uint16_t*)y->data;
+                for (size_t i = 0; i < x->ndata; ++i, advance()) {
+                    int si = scale_idx();
+                    uint16_t z = zeros ? zeros[si] : 0;
+                    py[i] = (uint16_t)std::clamp((int)std::nearbyint(px[i] / scales[si]) + z, 0, 65535);
+                }
+            } else if (y->type == NNR_DATA_TYPE_INT16) {
+                const int16_t* zeros = y_zero ? (const int16_t*)y_zero->data : nullptr;
+                int16_t* py = (int16_t*)y->data;
+                for (size_t i = 0; i < x->ndata; ++i, advance()) {
+                    int si = scale_idx();
+                    int16_t z = zeros ? zeros[si] : 0;
+                    py[i] = (int16_t)std::clamp((int)std::nearbyint(px[i] / scales[si]) + z, -32768, 32767);
+                }
             }
             return true;
         }

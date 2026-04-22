@@ -149,7 +149,7 @@ sequence_t::~sequence_t()
 // tensor_t
 // ---------------------------------------------------------------------------
 
-inline void delete_data(void* data, data_type_t type)
+void delete_data(void* data, data_type_t type)
 {
     if (type == NNR_DATA_TYPE_STRING) {
         delete[] (std::string*)data;
@@ -1210,25 +1210,34 @@ graph_output_reorder:
 
     // Reorder NHWC graph outputs to NCHW so caller always sees NCHW.
     // Internal ops may leave outputs in NHWC for efficiency, but the
-    // public API contract is NCHW output.
+    // public API contract is NCHW output.  Non-float types (uint8/int8
+    // for QDQ graphs, fp16 for attention) go through the byte-generic
+    // path since the SIMD nhwc_to_nchw is float-only.
     for (auto& name : ctx->graph_outputs) {
         tensor_t* t = ctx->search_tensor(name);
-        if (t && t->format == memory_layout_t::NHWC
-            && t->ndim == 4 && t->type == NNR_DATA_TYPE_FLOAT32) {
-            size_t sz = t->ndata * sizeof(float);
+        if (t && t->format == memory_layout_t::NHWC && t->ndim == 4) {
+            size_t elem_sz = data_type_sizeof(t->type);
+            size_t sz = t->ndata * elem_sz;
             if (sz > ctx->workspace_size)
                 ensure_workspace(ctx, sz);
 #ifdef DEBUG_LAYOUT
             auto rt0 = std::chrono::high_resolution_clock::now();
 #endif
-            reorder_inplace((float*)t->data, t->dims[0], t->dims[1],
-                t->dims[2], t->dims[3],
-                memory_layout_t::NHWC, memory_layout_t::NCHW,
-                (float*)ctx->workspace);
+            if (t->type == NNR_DATA_TYPE_FLOAT32) {
+                reorder_inplace((float*)t->data, t->dims[0], t->dims[1],
+                    t->dims[2], t->dims[3],
+                    memory_layout_t::NHWC, memory_layout_t::NCHW,
+                    (float*)ctx->workspace);
+            } else {
+                reorder_inplace_bytes(t->data, t->dims[0], t->dims[1],
+                    t->dims[2], t->dims[3],
+                    memory_layout_t::NHWC, memory_layout_t::NCHW,
+                    ctx->workspace, elem_sz);
+            }
 #ifdef DEBUG_LAYOUT
             auto rt1 = std::chrono::high_resolution_clock::now();
-            fprintf(stderr, "[reorder] graph output NHWC->NCHW [%d,%d,%d,%d] %.0f us\n",
-                t->dims[0], t->dims[1], t->dims[2], t->dims[3],
+            fprintf(stderr, "[reorder] graph output NHWC->NCHW [%d,%d,%d,%d] type=%d %.0f us\n",
+                t->dims[0], t->dims[1], t->dims[2], t->dims[3], (int)t->type,
                 std::chrono::duration<double, std::micro>(rt1 - rt0).count());
 #endif
             t->format = memory_layout_t::NCHW;
@@ -1378,6 +1387,12 @@ static bool fold_run(context_t* ctx)
 bool context_t::prepare()
 {
     if (!graph) return false;
+
+    // PREPROCESS-level passes (graph rewrites like LayerNorm + Gelu fusion)
+    // must run before fold_run so constant folding sees the fused graph.
+    // Without this, bench.exe misses graph rewrites that run() would apply
+    // via its first-run preprocess call.
+    optimizer->preprocess(this);
 
     // Reshape all nodes and exec only constant-foldable nodes.
     // Non-constant ops are skipped here; prune_segments() will warm them up
