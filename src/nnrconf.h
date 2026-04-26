@@ -28,6 +28,18 @@
 #include <unistd.h>
 #endif
 
+// MSVC-style aligned allocator polyfill for non-Windows targets.
+// The codebase calls _aligned_malloc(size, align) / _aligned_free(p) directly in
+// ~25 files; shim them inline on POSIX so those call sites stay single-platform.
+#ifndef _WIN32
+inline void* _aligned_malloc(size_t bytes, size_t align) {
+    void* p = nullptr;
+    if (posix_memalign(&p, align, bytes) != 0) return nullptr;
+    return p;
+}
+inline void _aligned_free(void* p) { std::free(p); }
+#endif
+
 #include "enchantum.hpp"
 
 // Compiler hints

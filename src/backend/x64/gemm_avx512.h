@@ -334,14 +334,14 @@ static NNR_NOINLINE void dgemm_row_remainder(
     const float* __restrict row_a,  // per-row A data, first remainder row
     int a_stride,                   // stride between A rows (KC for packed_a, o for packed_b)
     const float* __restrict pb,     // packed B sub-panel
-    float* __restrict C, int m,
+    float* __restrict C, int ldc,    // C row stride (m for contig, parent_C for NHWC alias)
     bool fuse_nchw, float fmin, float fmax,
     const PostFn& post_fn)
 {
     constexpr bool can_fuse = PostFn::per_row_bias;
     constexpr int JBLK = 64;
     for (int rem = 0, i = i_start; i < ie; i++, rem++) {
-        float* pci = C + (size_t)i * m;
+        float* pci = C + (size_t)i * ldc;
         const float* pai = row_a + (size_t)rem * a_stride;
         int v = j0;
         for (; v + 16 <= je; v += 16) {
@@ -865,11 +865,13 @@ inline void pack_b(float* __restrict dst, const float* __restrict B, int o, int 
 template <typename PostFn>
 // @nnr-meta isa=AVX512 dtype=fp32 layout=NCHW special=GEMM tiling=[K,MR,NR] fusion=post_op
 inline void dgemm_packed_b(int n, int m, int o, const float* __restrict A,
-    const float* __restrict packed_B, float* __restrict C, const PostFn& post_fn)
+    const float* __restrict packed_B, float* __restrict C, const PostFn& post_fn,
+    int ldc = 0)
 {
     constexpr bool can_fuse = PostFn::per_row_bias;
     constexpr int JBLK = 64;
     constexpr int KC = 256;
+    if (ldc == 0) ldc = m;  // default: contiguous C with row stride = m
     int nj = (m + JBLK - 1) / JBLK;
     int nk = (o + KC - 1) / KC;
     int ni = (n + JBLK - 1) / JBLK;
@@ -911,7 +913,7 @@ inline void dgemm_packed_b(int n, int m, int o, const float* __restrict A,
                 float* pc[8];
                 for (int r = 0; r < 8; r++) {
                     pa[r] = A + (size_t)(i + r) * o + k0;
-                    pc[r] = C + (size_t)(i + r) * m;
+                    pc[r] = C + (size_t)(i + r) * ldc;
                 }
 #if 0 // LOCUST
 ;                gen_pack_a_8(4)
@@ -958,12 +960,12 @@ inline void dgemm_packed_b(int n, int m, int o, const float* __restrict A,
             if (i < ie) {
                 NNR_PROFILE_COUNT("packed_b:row_remainder");
                 dgemm_row_remainder(i, ie, j0, je, k0, kc,
-                    A + (size_t)i * o + k0, o, pb, C, m,
+                    A + (size_t)i * o + k0, o, pb, C, ldc,
                     fuse_nchw, fmin, fmax, post_fn);
             }
         }
         if (!(can_fuse && post_fn.kind != post_op_kind::none))
-            post_fn.apply_rows(i0, ie, C, m, j0, jw);
+            post_fn.apply_rows(i0, ie, C, ldc, j0, jw);
     });
 }
 
@@ -1054,7 +1056,7 @@ inline void dgemm_packed_a(int n, int m, int o, const float* __restrict packed_A
     const bool prepack_b = (nj == 1 && m < JBLK);
     if (prepack_b) {
         size_t total = (size_t)nk * KC * JBLK;
-        shared_pb = (float*)_aligned_malloc(total * sizeof(float), 64);
+        shared_pb = (float*)nnr_aligned_alloc(total * sizeof(float), 64);
         if (shared_pb) {
             int jw = m;  // nj==1 means je-j0 == m
             for (int kt = 0; kt < nk; kt++) {
@@ -1236,7 +1238,7 @@ inline void dgemm_packed_a(int n, int m, int o, const float* __restrict packed_A
             post_fn.apply_rows(i0, ie, C, m, j0, jw);
     });
 
-    if (shared_pb) _aligned_free(shared_pb);
+    if (shared_pb) nnr_aligned_free(shared_pb);
 }
 
 // Batched GEMM for Winograd: performs 36 independent GEMMs sharing dispatch/threading.
@@ -1452,11 +1454,23 @@ inline void dgemm_packed_a_batch36(
 template <typename PostFn>
 // @nnr-meta isa=AVX512 dtype=fp32 layout=NHWC special=GEMM tiling=[K,MR,NR] fusion=post_op
 inline void dgemm_nhwc(int n, int m, int o, const float* __restrict A,
-    const float* __restrict packed_B, float* __restrict C, const PostFn& post_fn)
+    const float* __restrict packed_B, float* __restrict C, const PostFn& post_fn,
+    int ldc = 0)
 {
     constexpr int JBLK = 64;
     constexpr int KC = 256;
     constexpr int IBLK = 64;
+    if (ldc == 0) ldc = m;
+    // Strided dst (NHWC concat alias): the C-hot path inline-stores via
+    // `* m` arithmetic and would need a sweeping rewrite to honor ldc.
+    // Instead, route to dgemm_packed_b which builds row pointers explicitly
+    // and already honors ldc. Performance: packed_b is ~within-noise of
+    // nhwc on small NHWC convs; the concat-alias path firing at all is the
+    // bigger win vs the previous scalar fallback.
+    if (ldc != m) {
+        avx512::dgemm_packed_b(n, m, o, A, packed_B, C, post_fn, ldc);
+        return;
+    }
     int nj = (m + JBLK - 1) / JBLK;
     int nk = (o + KC - 1) / KC;
     int ni = (n + IBLK - 1) / IBLK;

@@ -15,32 +15,32 @@ struct Constant_operator : public operator_t {
             return attribute(attr_key_t::value, y);
         }
         if (aname == attr_key_t::value_float) {
-            y->reinit(NNR_DATA_TYPE_FLOAT32, {});
+            if (!y->reinit(NNR_DATA_TYPE_FLOAT32, {})) return false;
             y->apply(&a.f, sizeof(float));
             return true;
         }
         if (aname == attr_key_t::value_int) {
-            y->reinit(NNR_DATA_TYPE_INT64, {});
+            if (!y->reinit(NNR_DATA_TYPE_INT64, {})) return false;
             y->apply(&a.i, sizeof(int64_t));
             return true;
         }
         if (aname == attr_key_t::value_floats) {
             if (a.floats.empty()) return false;
             int dims[] = { (int)a.floats.size() };
-            y->reinit(NNR_DATA_TYPE_FLOAT32, dims);
+            if (!y->reinit(NNR_DATA_TYPE_FLOAT32, dims)) return false;
             y->apply(a.floats.data(), a.floats.size() * sizeof(float));
             return true;
         }
         if (aname == attr_key_t::value_ints) {
             if (a.ints.empty()) return false;
             int dims[] = { (int)a.ints.size() };
-            y->reinit(NNR_DATA_TYPE_INT64, dims);
+            if (!y->reinit(NNR_DATA_TYPE_INT64, dims)) return false;
             y->apply(a.ints.data(), a.ints.size() * sizeof(int64_t));
             return true;
         }
         if (aname == attr_key_t::value_string) {
             int dims[] = { 1 };
-            y->reinit(NNR_DATA_TYPE_STRING, dims);
+            if (!y->reinit(NNR_DATA_TYPE_STRING, dims)) return false;
             if (y->data) ((std::string*)y->data)[0] = a.s;
             return true;
         }

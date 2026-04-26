@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 
 // Hand-rolled read-only FlatBuffer accessors for the TFLite schema.
 // FlatBuffers are little-endian, zero-copy: every accessor reads directly
@@ -99,12 +100,16 @@ struct fb_table {
         return target;
     }
 
-    const char* field_str(int fi) const {
+    // Returns a string_view bounded by the FlatBuffer stored length. Does not
+    // assume a null terminator exists or is in bounds — FlatBuffer writers are
+    // supposed to include one, but a crafted buffer may omit it, so callers
+    // must not pass the .data() pointer to strlen or C string APIs.
+    std::string_view field_str(int fi) const {
         const uint8_t* p = field_ptr(fi);
-        if (!p || !ok(p, 4)) return nullptr;
+        if (!p || !ok(p, 4)) return {};
         uint32_t len = fb_u32(p);
-        if (!ok(p + 4, len + 1)) return nullptr;
-        return (const char*)(p + 4);
+        if (!ok(p + 4, len)) return {};
+        return std::string_view((const char*)(p + 4), len);
     }
 
     int32_t field_str_len(int fi) const {
@@ -144,15 +149,18 @@ struct fb_vec {
         return fb_table(target, ctx);
     }
 
-    const char* str(uint32_t i) const {
-        if (i >= size()) return nullptr;
+    // Returns a string_view bounded by the FlatBuffer stored length. Does not
+    // assume a trailing null terminator is in bounds — callers must not treat
+    // .data() as a C string.
+    std::string_view str(uint32_t i) const {
+        if (i >= size()) return {};
         const uint8_t* p = buf + 4 + (size_t)i * 4;
-        if (!ok(p, 4)) return nullptr;
+        if (!ok(p, 4)) return {};
         const uint8_t* s = p + fb_u32(p);
-        if (!ok(s, 4)) return nullptr;
+        if (!ok(s, 4)) return {};
         uint32_t len = fb_u32(s);
-        if (!ok(s + 4, len + 1)) return nullptr;
-        return (const char*)(s + 4);
+        if (!ok(s + 4, len)) return {};
+        return std::string_view((const char*)(s + 4), len);
     }
 };
 
@@ -447,7 +455,7 @@ struct Model {
     int32_t version() const { return t.field_i32(0, 0); }
     fb_vec operator_codes() const { return fb_vec(t.field_ptr(1), t.ctx); }
     fb_vec subgraphs() const { return fb_vec(t.field_ptr(2), t.ctx); }
-    const char* description() const { return t.field_str(3); }
+    std::string_view description() const { return t.field_str(3); }
     fb_vec buffers() const { return fb_vec(t.field_ptr(4), t.ctx); }
 };
 
@@ -459,7 +467,7 @@ struct OperatorCode {
         if (code >= 0) return code;
         return (int32_t)t.field_i8(0, 0);
     }
-    const char* custom_code() const { return t.field_str(1); }
+    std::string_view custom_code() const { return t.field_str(1); }
     int32_t version() const { return t.field_i32(2, 1); }
 };
 
@@ -470,7 +478,7 @@ struct SubGraph {
     fb_vec_i32 inputs() const { return fb_vec_i32(t.field_ptr(1), t.ctx); }
     fb_vec_i32 outputs() const { return fb_vec_i32(t.field_ptr(2), t.ctx); }
     fb_vec operators() const { return fb_vec(t.field_ptr(3), t.ctx); }
-    const char* name() const { return t.field_str(4); }
+    std::string_view name() const { return t.field_str(4); }
 };
 
 struct Tensor {
@@ -479,7 +487,7 @@ struct Tensor {
     fb_vec_i32 shape() const { return fb_vec_i32(t.field_ptr(0), t.ctx); }
     int8_t type() const { return t.field_i8(1, 0); }
     uint32_t buffer() const { return (uint32_t)t.field_i32(2, 0); }
-    const char* name() const { return t.field_str(3); }
+    std::string_view name() const { return t.field_str(3); }
     fb_table quantization() const { return t.field_table(4); }
     fb_vec_i32 shape_signature() const { return fb_vec_i32(t.field_ptr(11), t.ctx); }
 };

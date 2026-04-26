@@ -24,6 +24,18 @@ inline float nchw_stride_util(int H, int W) {
     return std::max(COST_NCHW_STRIDE_FLOOR, 1.0f / (float)(H * W));
 }
 
+// BLOCKED (NCHWc) reads channel-blocks: each c-block load is exactly one
+// SIMD register / cache line. Utilization = C / round_up(C, block) — i.e.
+// 1.0 when C is block-aligned (the chain-eligibility gate enforces this on
+// input C, so eligible chains see util == 1). For ineligible chains the
+// IC-tail waste lowers util proportionally.
+inline float block_simd_util(int C, int block) {
+    if (block <= 0) return 1.0f;
+    int padded = ((C + block - 1) / block) * block;
+    if (padded <= 0) return 1.0f;
+    return (float)C / (float)padded;
+}
+
 // --- Empirical penalties (AVX-512) ---
 
 

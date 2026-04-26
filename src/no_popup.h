@@ -97,6 +97,28 @@ inline EXCEPTION_POINTERS* g_seh_ep;
 inline int seh_filter(EXCEPTION_POINTERS* ep)
 {
     g_seh_ep = ep;
+    // Write a minidump beside the executable so post-mortem analysis can
+    // recover the crash site even when running under cdb suppresses the bug
+    // (Heisenbug pattern). Filename includes pid so concurrent runs don't
+    // clobber each other.
+    char dump_name[64];
+    std::snprintf(dump_name, sizeof(dump_name), "crash_%lu.dmp",
+                  (unsigned long)GetCurrentProcessId());
+    HANDLE hf = CreateFileA(dump_name, GENERIC_WRITE, 0, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei{};
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = ep;
+        mei.ClientPointers = FALSE;
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hf,
+                          (MINIDUMP_TYPE)(MiniDumpWithFullMemory |
+                                          MiniDumpWithThreadInfo |
+                                          MiniDumpWithHandleData),
+                          &mei, NULL, NULL);
+        CloseHandle(hf);
+        fprintf(stderr, "minidump: %s\n", dump_name);
+    }
     print_backtrace(ep);
     return EXCEPTION_EXECUTE_HANDLER;
 }

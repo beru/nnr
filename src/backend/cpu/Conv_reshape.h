@@ -35,6 +35,28 @@
         // Cache dimensions for workspace_size()
         ws_CHW = 0; ws_spatial = 0; ws_kHW = 0; ws_oW = 0;
         ws_nhwc_reorder = 0;
+        // 1D Conv (ndim==3): size im2col workspace as 2D with H=1. No NHWC/NCHWc
+        // eligibility — 1D models (e.g. Whisper encoder front-end) run the
+        // NCHW/FP16 scalar im2col+GEMM path.
+        if (ndim == 3) {
+            const int kC = w->dims[1];
+            const int kL = w->dims[2];
+            const int CHW = kC * kL;
+            const int oL = dims[2];
+            const int iC = x->dims[1];
+            const bool depthwise = (group == iC && kC == 1);
+            const bool is1x1 = (kL == 1
+                && strides.size() >= 1 && strides[0] == 1
+                && dilations[0] == 1
+                && cpads[0] == 0 && cpads[kernels.size()] == 0);
+            const bool true_dw = depthwise && (w->dims[0] == iC);
+            if (!is1x1 && (!depthwise || !true_dw)) {
+                ws_CHW = CHW;
+                ws_spatial = oL;
+                ws_kHW = kL;
+                ws_oW = oL;
+            }
+        }
         if (ndim == 4) {
             const int kC = w->dims[1], kH = w->dims[2], kW = w->dims[3];
             const int kHW = kH * kW, CHW = kC * kHW;
@@ -58,6 +80,16 @@
             if (is1x1 && !depthwise && group == 1 && x->type == NNR_DATA_TYPE_FLOAT32) {
                 layout_mask = LAYOUT_NCHW | LAYOUT_NHWC;
                 const int M = w->dims[0];
+#ifdef NNR_ARCH_X64
+                // NCHWc 1x1 conv: kernel + weight pack already exist in
+                // exec_nchwc_blocked (conv1x1_nchwc_avx512 / pack_weight_nchwc_1x1).
+                // Advertise the layout so chains containing 1x1 Convs can stay in
+                // BLOCKED_16 — and so their Concat outputs become alias-eligible
+                // in memory_planner (Phase 4.5 of assign_blocked_layouts).
+                if (iC % NATIVE_BLOCK == 0 && M % NATIVE_BLOCK == 0
+                    && iC >= NATIVE_BLOCK && M >= NATIVE_BLOCK)
+                    layout_mask |= LAYOUT_NATIVE_BLOCKED;
+#endif
                 w_nhwc.resize(M * iC);
                 transpose_weights(w_nhwc.data(), (const float*)w->data, M, iC);
                 w_dw_nhwc.clear();
@@ -118,6 +150,22 @@
                 }
                 w_packed.clear(); // packed lazily in exec() when NHWC is actually assigned
                 ws_nhwc_reorder = (size_t)x->dims[0] * iC * x->dims[2] * x->dims[3] * sizeof(float);
+            } else if (x->type == NNR_DATA_TYPE_FLOAT16) {
+                // FP16 on ARM64: advertise NHWC so the layout optimizer can
+                // promote FP16 chains to NHWC, which unlocks the native
+                // `exec_fp16_{dw,}nhwc_direct_neon` paths.  The FP16-specific
+                // NHWC packs (`w_fp16_nhwc_direct`, `w_fp16_dw_nhwc`) are
+                // populated separately in the NNR_ARCH_ARM64 block below;
+                // the FP32 packs (`w_nhwc` etc.) are unused on this path.
+#ifdef NNR_ARCH_ARM64
+                layout_mask = LAYOUT_NCHW | LAYOUT_NHWC;
+#else
+                layout_mask = LAYOUT_NCHW;
+#endif
+                w_nhwc.clear();
+                w_dw_nhwc.clear();
+                w_gemm_nhwc.clear();
+                w_packed.clear();
             } else {
                 layout_mask = LAYOUT_NCHW;
                 w_nhwc.clear();
@@ -196,17 +244,33 @@
             // BLOCKED_8; general K×K and depthwise land in later milestones.
 #ifdef NNR_ARCH_X64
             // NCHWc (LAYOUT_NATIVE_BLOCKED) eligibility:
-            //   - IC must be a multiple of NATIVE_BLOCK (input side is the
-            //     expensive reorder and we reuse the blocked storage directly).
+            //   - IC ≥ NATIVE_BLOCK. IC-tail (iC % NATIVE_BLOCK != 0) is
+            //     accepted for K×K (K > 1) Convs only when the partial last
+            //     block is at least half-full (ic_tail >= block/2). The kernel
+            //     iterates ICb = ceil(IC/block) and FMAs over zero-padded lanes
+            //     contribute 0, but those wasted lanes still consume issue slots.
+            //     1×1 Convs are bandwidth-bound, so any IC-tail waste dominates
+            //     (mobilenetv2's iC=24 1×1 expands regress +9% with IC-tail).
+            //     K×K Convs amortize waste over kH*kW reuse — googlenet inception
+            //     branch3.1 (iC=24, tail=8=block/2, 3×3) wins -16% by joining the
+            //     chain that unblocks two Concat aliases. But densenet-/efficientnet-
+            //     style chains with smaller tails (e.g., tail=2-6) over-promote
+            //     into long BLOCKED chains where boundary reorders + partial-block
+            //     waste exceed the alias savings (densenetblur121d +38%, densenet-
+            //     12-int8 +76% under unconditional K×K IC-tail). The block/2
+            //     threshold caps wasted SIMD lanes at <=50% of the last block.
             //   - OC no longer required to be a multiple of NATIVE_BLOCK.
             //     OC-tail Convs become "terminal blocked consumers": they
             //     accept BLOCKED_16 input (avoiding the large input reorder)
             //     but produce NCHW output via an OCb-sized workspace buffer
             //     plus a small nchwc_to_nchw transpose. This is what unlocks
             //     the SSD-12 pred-head chain (OC ∈ {24, 324, 486}).
+            const int ic_tail = iC % NATIVE_BLOCK;
+            const bool ic_tail_ok = (ic_tail == 0)
+                || ((kH > 1 || kW > 1) && ic_tail >= NATIVE_BLOCK / 2);
             if (!depthwise && group == 1 && x->type == NNR_DATA_TYPE_FLOAT32
-                && iC % NATIVE_BLOCK == 0
                 && iC >= NATIVE_BLOCK && w->dims[0] >= 1
+                && ic_tail_ok
                 && dilations[0] == 1 && dilations[1] == 1) {
                 layout_mask |= LAYOUT_NATIVE_BLOCKED;
                 // Workspace for NCHWc convolution at chain boundary.
@@ -224,6 +288,16 @@
                     // per batch (processed one batch at a time).
                     ws_nchwc_reorder = ((size_t)iC + OC) * oH * oW * sizeof(float);
                     if (oc_tail) ws_nchwc_reorder = std::max(ws_nchwc_reorder, out_blk);
+                    // 1×1 stride>1 falls through to the general K×K NCHWc strip
+                    // path (the 1×1 fast path requires sH=1). When the input is
+                    // NCHW (boundary case), exec_strip reorders into NCHWc
+                    // workspace sized [N][ICb][iH][iW][block].
+                    if (strides[0] != 1 || strides[1] != 1) {
+                        const int ICb = (iC + block - 1) / block;
+                        size_t in_blk = (size_t)x->dims[0] * ICb
+                                      * x->dims[2] * x->dims[3] * block * sizeof(float);
+                        ws_nchwc_reorder = std::max(ws_nchwc_reorder, in_blk);
+                    }
                 } else {
                     // Pre-padding eliminates bounds-checking branches in the kernel's
                     // inner loop — critical for small spatial (7×7: ~27-49% edge pixels).
@@ -354,24 +428,74 @@
 #endif
         }
         // FP16/BF16: pre-convert weights and bias to float32 (one-time cost in reshape)
-        _aligned_free(w_f32); w_f32 = nullptr;
-        _aligned_free(bias_f32); bias_f32 = nullptr;
+        nnr_aligned_free(w_f32); w_f32 = nullptr;
+        nnr_aligned_free(bias_f32); bias_f32 = nullptr;
         if (x->type == NNR_DATA_TYPE_FLOAT16) {
             size_t wn = w->ndata;
-            w_f32 = (float*)_aligned_malloc(wn * sizeof(float), 64);
+            w_f32 = (float*)nnr_aligned_alloc(wn * sizeof(float), 64);
             convert_f16_to_f32(w_f32, (const float16_t*)w->data, wn);
             if (inputs.size() > 2 && inputs[2]->data) {
                 size_t bn = inputs[2]->ndata;
-                bias_f32 = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                bias_f32 = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                 convert_f16_to_f32(bias_f32, (const float16_t*)inputs[2]->data, bn);
             }
+            // FP16 native NCHW direct conv pack — ARM64 only, eligible shapes:
+            //   4D conv, group=1, dilation=1, not depthwise.
+            // The pack is small relative to the FP32 convert above and leaves
+            // the FP32 fallback intact for shapes the kernel can't handle.
+#ifdef NNR_ARCH_ARM64
+            w_fp16_direct.clear();
+            w_fp16_nhwc_direct.clear();
+            w_fp16_dw_nhwc.clear();
+            if (has_neon_fp16() && x->ndim == 4
+                && dilations.size() >= 2) {
+                const int M_oc = w->dims[0];
+                const int kC_w = w->dims[1];
+                const int kH_w = w->dims[2], kW_w = w->dims[3];
+                const int iC_x = x->dims[1];
+                const bool depthwise_fp16 = (group == iC_x && kC_w == 1);
+                if (depthwise_fp16 && M_oc == iC_x) {
+                    // Depthwise FP16 NHWC pack: [C, 1, kH, kW] → [kH*kW, C] FP16.
+                    size_t psz_dw = nnr::fp16::neon::repack_weights_depthwise_fp16_nhwc_size(
+                        iC_x, kH_w, kW_w);
+                    if (psz_dw > 0) {
+                        w_fp16_dw_nhwc.resize(psz_dw / sizeof(uint16_t));
+                        nnr::fp16::neon::repack_weights_depthwise_fp16_nhwc(
+                            w_fp16_dw_nhwc.data(),
+                            (const uint16_t*)w->data,
+                            iC_x, kH_w, kW_w);
+                    }
+                }
+                if (!depthwise_fp16 && group == 1
+                    && dilations[0] == 1 && dilations[1] == 1) {
+                    size_t psz = nnr::fp16::neon::pack_weights_fp16_direct_neon_size(
+                        M_oc, kC_w, kH_w, kW_w);
+                    if (psz > 0) {
+                        w_fp16_direct.resize(psz / sizeof(uint16_t));
+                        nnr::fp16::neon::pack_weights_fp16_direct_neon(
+                            w_fp16_direct.data(),
+                            (const uint16_t*)w->data,
+                            M_oc, kC_w, kH_w, kW_w);
+                    }
+                    size_t psz_nhwc = nnr::fp16::neon::pack_weights_fp16_direct_nhwc_neon_size(
+                        M_oc, kC_w, kH_w, kW_w);
+                    if (psz_nhwc > 0) {
+                        w_fp16_nhwc_direct.resize(psz_nhwc / sizeof(uint16_t));
+                        nnr::fp16::neon::pack_weights_fp16_direct_nhwc_neon(
+                            w_fp16_nhwc_direct.data(),
+                            (const uint16_t*)w->data,
+                            M_oc, kC_w, kH_w, kW_w);
+                    }
+                }
+            }
+#endif
         } else if (x->type == NNR_DATA_TYPE_BFLOAT16) {
             size_t wn = w->ndata;
-            w_f32 = (float*)_aligned_malloc(wn * sizeof(float), 64);
+            w_f32 = (float*)nnr_aligned_alloc(wn * sizeof(float), 64);
             convert_bf16_to_f32(w_f32, (const bfloat16_t*)w->data, wn);
             if (inputs.size() > 2 && inputs[2]->data) {
                 size_t bn = inputs[2]->ndata;
-                bias_f32 = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                bias_f32 = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                 convert_bf16_to_f32(bias_f32, (const bfloat16_t*)inputs[2]->data, bn);
             }
         }

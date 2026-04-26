@@ -98,6 +98,12 @@ void fuse_conv_bn(context_t* ctx)
                 buf[2] = new_bias;
                 conv->inputs = std::span<tensor_t*>(buf, new_count);
             }
+            // Re-reshape so backend-specific state can register the newly
+            // attached bias (e.g. WebGPU's per-tensor GPU buffer registry).
+            // Inputs were rewired after fold_run's reshape pass; without
+            // this call the bias slot has no GPU buffer and Conv exec
+            // dereferences a null find() result.
+            conv->reshape();
         } else {
             // Conv already has bias — fuse BN into it
             float* bp = (float*)conv_bias->data;
@@ -107,8 +113,39 @@ void fuse_conv_bn(context_t* ctx)
             }
         }
 
-        // Skip BN — wire its output to Conv's output
-        bn->skip = true;
+        // Eliminate BN from the graph. Two paths:
+        //
+        //  1. Normal case — retarget every consumer of T_bn (BN's output) to
+        //     read T_conv (Conv's output) directly, then mark BN folded.
+        //     This makes the graph topologically clean: downstream passes
+        //     like fuse_webgpu_matmul_chain now see Conv → next-op as a
+        //     direct edge rather than Conv → [BN skip-alias] → next-op,
+        //     which was silently hiding Conv+Relu fusibility on cnn_bench.
+        //
+        //  2. Graph-output case — if T_bn is one of ctx->graph_outputs, the
+        //     caller looks it up by name, so we can't eliminate the tensor.
+        //     Fall back to the legacy skip-alias path (runtime copies
+        //     Conv's data ptr into T_bn at exec time, see nnr.cpp SKIP case).
+        tensor_t* t_conv = conv->outputs[0];
+        tensor_t* t_bn   = bn->outputs[0];
+        bool t_bn_is_graph_output = false;
+        if (t_bn && t_bn != t_conv) {
+            for (auto& gname : ctx->graph_outputs) {
+                if (t_bn->name == gname) { t_bn_is_graph_output = true; break; }
+            }
+        }
+        if (!t_bn || t_bn == t_conv || t_bn_is_graph_output) {
+            bn->skip = true;
+        } else {
+            for (int j = 0; j < n; ++j) {
+                if (j == i || j == i + 1) continue;
+                auto* op = nodes[j];
+                for (size_t k = 0; k < op->inputs.size(); ++k) {
+                    if (op->inputs[k] == t_bn) op->inputs[k] = t_conv;
+                }
+            }
+            bn->folded = true;
+        }
     }
 }
 

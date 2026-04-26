@@ -53,6 +53,11 @@ static constexpr int NCHWC_WINOGRAD_MIN_TILES = 16;
 
 void assign_blocked_layouts(context_t* ctx)
 {
+    // CPU-only pass. NCHWc/BLOCKED is an x64 (AVX-512) and ARM64 (NEON)
+    // layout — no GPU equivalent. CUDA backend has its own layout
+    // pipeline (NHWC int8 for WMMA). Single-backend-per-run gate.
+    if (static_cast<backend_t>(ctx->preferred_backend) != backend_t::CPU) return;
+
     auto& nodes = ctx->graph->nodes;
     const int n = static_cast<int>(nodes.size());
     if (n == 0) return;
@@ -108,7 +113,12 @@ void assign_blocked_layouts(context_t* ctx)
 
         // Rule 3: IC block alignment. OC-tail Convs are allowed as terminal
         // consumers — the kernel handles zero-padded last-OCb automatically.
-        if (iC % block != 0 || iC < block || oC < 1) continue;
+        // IC-tail (iC % block != 0): also OK at chain entry — nchw_to_nchwc
+        // zero-fills the partial last block, pack_weight_nchwc_blocked
+        // matches with zero-padded weights, and the FMA over zero lanes
+        // contributes 0. Rejection of iC < block keeps first-layer (iC=3
+        // RGB) Convs out — those have a dedicated conv_first_layer path.
+        if (iC < block || oC < 1) continue;
 
         // Rule 4: no dilation — NCHWc kernel has no dilated path.
         int64_t* dilations = nullptr;
@@ -258,8 +268,29 @@ void assign_blocked_layouts(context_t* ctx)
         int group = nd->attribute("group", (int32_t)1);
         return (group == iC && w->dims[1] == 1);
     };
+    // Direct per-chain NHWC vs BLOCKED comparison using each op's
+    // layout_cost(BLOCKED_*) override (T1: see Conv.cpp / Pool / QLinearConv).
+    // Boundary reorder costs are equal under reorder_cost() (NCHW↔NHWC and
+    // NCHW↔BLOCKED both ~ 2.5× bytes), so they cancel out when comparing
+    // the two within a chain — no boundary term needed here.
+    //
+    // Replaces the historical NCHW-vs-NHWC proxy with magic 0.60 threshold;
+    // see git history for the per-arch tuning issues that motivated T1.
+    auto chain_nhwc_better_than_blocked = [&](const std::vector<int>& convs) -> bool {
+        float nhwc_cost = 0, blocked_cost = 0;
+        bool first = true;
+        for (int ci : convs) {
+            auto* nd = nodes[ci];
+            nhwc_cost    += nd->layout_cost(memory_layout_t::NHWC, !first);
+            blocked_cost += nd->layout_cost(NATIVE_BLOCKED_FMT,    false);
+            first = false;
+        }
+        return blocked_cost > 0 && nhwc_cost < blocked_cost;
+    };
+
     std::vector<bool> accepted(n, false);
     std::unordered_map<int, const char*> reject_reason;
+    std::unordered_map<int, std::vector<int>> all_1x1_chains;  // root → conv idxs
     for (auto& [root, convs] : chain_groups) {
         bool all_1x1 = true;
         bool all_dw = true;
@@ -275,9 +306,256 @@ void assign_blocked_layouts(context_t* ctx)
         // rejection so individual kernels can be validated in isolation
         // (e.g., the ARM M1 plan lands a 1x1 NCHWc kernel before any
         // mixed-chain candidate exists). Production leaves this off.
-        if (all_1x1 && !force_nchwc) { reject_reason[root] = "all-1x1"; continue; }
+        if (all_1x1 && !force_nchwc) {
+            reject_reason[root] = "all-1x1";
+            all_1x1_chains[root] = convs;
+            continue;
+        }
         if (all_dw  && !force_nchwc) { reject_reason[root] = "all-dw";  continue; }
+        if (!force_nchwc && chain_nhwc_better_than_blocked(convs)) {
+            reject_reason[root] = "nhwc-better-than-blocked";
+            continue;
+        }
         for (int ci : convs) accepted[ci] = true;
+    }
+
+    // Phase 3.5 (forward-look): promote rejected all-1×1 chains when their
+    // output feeds a Phase-4.5-eligible Concat whose OTHER inputs are already
+    // (or will also be) BLOCKED. Without this promotion, inception / squeezenet
+    // / densenet Concats see mixed-format inputs and Phase 4.5 falls through,
+    // forcing the planner to materialize per-input memcpys instead of aliasing
+    // each producer directly into the Concat output buffer.
+    //
+    // Each promoted chain pays NCHW↔BLOCKED entry/exit reorders, so we only
+    // promote when the chain itself can register a BLOCKED output (every
+    // conv has OC % block == 0 — otherwise Phase 4 skips its output as a
+    // "terminal blocked consumer" producing NCHW, defeating the upgrade).
+    auto chain_terminal_outputs = [&](const std::vector<int>& convs) {
+        std::vector<tensor_t*> ys;
+        std::unordered_set<int> in_chain(convs.begin(), convs.end());
+        for (int ci : convs) {
+            for (auto* y : nodes[ci]->outputs) {
+                if (!y) continue;
+                auto cit = tensor_consumers.find(y);
+                if (cit == tensor_consumers.end()) { ys.push_back(y); continue; }
+                bool external = false;
+                for (int c_idx : cit->second) if (!in_chain.count(c_idx)) { external = true; break; }
+                if (external) ys.push_back(y);
+            }
+        }
+        return ys;
+    };
+
+    auto chain_oc_aligned = [&](const std::vector<int>& convs) {
+        for (int ci : convs) {
+            auto* w = nodes[ci]->inputs[1];
+            if (!w) return false;
+            if (w->dims[0] % block != 0) return false;
+        }
+        return true;
+    };
+
+    auto concat_phase45_eligible = [&](operator_t* nd) -> bool {
+        if (nd->op_type != "Concat") return false;
+        if (nd->skip || nd->folded) return false;
+        if (nd->inputs.empty() || nd->outputs.empty()) return false;
+        auto* y = nd->outputs[0];
+        if (!y || y->ndim != 4 || y->type != NNR_DATA_TYPE_FLOAT32) return false;
+        if (y->dims[1] % block != 0) return false;
+        int axis = nd->attribute("axis", (int32_t)0);
+        if (axis < 0) axis += y->ndim;
+        if (axis != 0 && axis != 1) return false;
+        if (axis == 1 && y->dims[0] != 1) return false;
+        if (axis == 1) {
+            for (auto* in : nd->inputs)
+                if (!in || in->dims[1] % block != 0) return false;
+        }
+        return true;
+    };
+
+    if (!force_nchwc && !all_1x1_chains.empty()) {
+        // Currently-blocked outputs after Phase 3 (will-also-be-promoted set
+        // grows during the forward-look loop below).
+        std::unordered_set<tensor_t*> will_be_blocked;
+        for (int i = 0; i < n; ++i) {
+            if (!accepted[i]) continue;
+            for (auto* y : nodes[i]->outputs)
+                if (y && y->ndim == 4 && y->type == NNR_DATA_TYPE_FLOAT32
+                    && y->dims[1] % block == 0)
+                    will_be_blocked.insert(y);
+        }
+        // Map each candidate all-1×1 chain output → root, so the
+        // "all OTHER inputs of the Concat will be blocked" check can
+        // see promotable chains as also-blocked.
+        std::unordered_map<tensor_t*, int> candidate_output_to_root;
+        for (auto& [root, convs] : all_1x1_chains) {
+            if (!chain_oc_aligned(convs)) continue;
+            for (auto* y : chain_terminal_outputs(convs))
+                candidate_output_to_root[y] = root;
+        }
+        // Walk forward from `y` through skip/folded transparent ops
+        // (e.g., Conv→Relu where Relu is post_fn-fused → marked folded but
+        // still in graph). Returns the first non-skip consumer-tensor pair
+        // (consumer_node_idx, tensor reaching it). Stops at first eligible
+        // Concat consumer; otherwise returns -1.
+        auto find_concat_through_folded = [&](tensor_t* y_in) -> std::pair<int, tensor_t*> {
+            tensor_t* y = y_in;
+            for (int hop = 0; hop < 8; ++hop) {
+                auto cit = tensor_consumers.find(y);
+                if (cit == tensor_consumers.end()) return {-1, nullptr};
+                if (cit->second.size() != 1) {
+                    // Multiple consumers — only proceed if one of them is
+                    // an eligible Concat directly.
+                    for (int c_idx : cit->second) {
+                        auto* c_nd = nodes[c_idx];
+                        if (concat_phase45_eligible(c_nd)) return {c_idx, y};
+                    }
+                    return {-1, nullptr};
+                }
+                int c_idx = cit->second[0];
+                auto* c_nd = nodes[c_idx];
+                if (concat_phase45_eligible(c_nd)) return {c_idx, y};
+                if (!(c_nd->skip || c_nd->folded)) return {-1, nullptr};
+                if (c_nd->outputs.empty() || !c_nd->outputs[0]) return {-1, nullptr};
+                y = c_nd->outputs[0];
+            }
+            return {-1, nullptr};
+        };
+
+        // Per-chain rejection log for the forward-look loop (debug_layout only).
+        // Surfaces why all-1×1 chains aren't getting promoted to BLOCKED on
+        // inception/squeezenet — which silently kills Concat aliasing wins.
+        struct fwd_diag_t {
+            const char* reason = nullptr;
+            tensor_t* blocking_in = nullptr;
+            int concat_idx = -1;
+        };
+        std::unordered_map<int, fwd_diag_t> last_diag;
+
+        bool fwd_changed = true;
+        while (fwd_changed) {
+            fwd_changed = false;
+            for (auto& [root, convs] : all_1x1_chains) {
+                if (accepted[convs.front()]) continue;
+                if (!chain_oc_aligned(convs)) {
+                    if (debug_layout) last_diag[root] = {"oc-not-aligned", nullptr, -1};
+                    continue;
+                }
+                auto outs = chain_terminal_outputs(convs);
+                bool unlock = false;
+                fwd_diag_t worst{"no-eligible-concat", nullptr, -1};
+                for (auto* y : outs) {
+                    auto [c_idx, y_at_concat] = find_concat_through_folded(y);
+                    if (c_idx < 0) continue;
+                    worst = {"some-input-not-blocked", nullptr, c_idx};
+                    auto* c_nd = nodes[c_idx];
+                    bool all_ok = true;
+                    for (auto* in : c_nd->inputs) {
+                        if (!in) { all_ok = false; worst.blocking_in = nullptr; break; }
+                        if (in == y_at_concat) continue;
+                        if (will_be_blocked.count(in)) continue;
+                        if (candidate_output_to_root.count(in)) continue;
+                        // Walk back through folded transparent ops to find the
+                        // ultimate producer's Conv output (mirrors the forward
+                        // walk above).
+                        tensor_t* src = in;
+                        bool found = false;
+                        for (int hop = 0; hop < 8; ++hop) {
+                            auto pit = tensor_producer.find(src);
+                            if (pit == tensor_producer.end()) break;
+                            auto* p_nd = nodes[pit->second];
+                            if (!(p_nd->skip || p_nd->folded)) break;
+                            if (p_nd->inputs.empty() || !p_nd->inputs[0]) break;
+                            src = p_nd->inputs[0];
+                            if (will_be_blocked.count(src)) { found = true; break; }
+                            if (candidate_output_to_root.count(src)) { found = true; break; }
+                        }
+                        if (!found) { all_ok = false; worst.blocking_in = in; break; }
+                    }
+                    if (all_ok) { unlock = true; worst.reason = nullptr; break; }
+                }
+                if (unlock) {
+                    for (int ci : convs) accepted[ci] = true;
+                    for (auto* y : outs) will_be_blocked.insert(y);
+                    reject_reason.erase(root);
+                    fwd_changed = true;
+                    last_diag.erase(root);
+                } else if (debug_layout) {
+                    last_diag[root] = worst;
+                }
+            }
+        }
+        if (debug_layout) {
+            for (auto& [root, d] : last_diag) {
+                if (!d.reason) continue;
+                const char* concat_name = "?";
+                size_t concat_name_len = 1;
+                if (d.concat_idx >= 0 && !nodes[d.concat_idx]->outputs.empty()
+                    && nodes[d.concat_idx]->outputs[0]) {
+                    auto& nm = nodes[d.concat_idx]->outputs[0]->name;
+                    concat_name = nm.data();
+                    concat_name_len = nm.size();
+                }
+                const char* blk_name = "?";
+                size_t blk_name_len = 1;
+                if (d.blocking_in) {
+                    blk_name = d.blocking_in->name.data();
+                    blk_name_len = d.blocking_in->name.size();
+                }
+                // For "some-input-not-blocked", trace back through skip chain
+                // to find the producer Conv and report whether it was
+                // accepted, its OC, and OC%block (the OC-tail case).
+                char tail_info[128] = "";
+                if (d.blocking_in && d.reason
+                    && std::string_view(d.reason) == "some-input-not-blocked") {
+                    tensor_t* src = d.blocking_in;
+                    int prod_idx = -1;
+                    for (int hop = 0; hop < 8; ++hop) {
+                        auto pit = tensor_producer.find(src);
+                        if (pit == tensor_producer.end()) break;
+                        prod_idx = pit->second;
+                        auto* p = nodes[prod_idx];
+                        if (!(p->skip || p->folded)) break;
+                        if (p->inputs.empty() || !p->inputs[0]) break;
+                        src = p->inputs[0];
+                    }
+                    if (prod_idx >= 0) {
+                        auto* p = nodes[prod_idx];
+                        int oc = -1, ic = -1, kH = -1, kW = -1;
+                        const char* prod_name = "?";
+                        size_t prod_name_len = 1;
+                        if (!p->outputs.empty() && p->outputs[0]
+                            && p->outputs[0]->ndim >= 2) {
+                            oc = p->outputs[0]->dims[1];
+                            prod_name = p->outputs[0]->name.data();
+                            prod_name_len = p->outputs[0]->name.size();
+                        }
+                        if (p->inputs.size() >= 2 && p->inputs[0] && p->inputs[1]
+                            && p->inputs[0]->ndim >= 2 && p->inputs[1]->ndim == 4) {
+                            ic = p->inputs[0]->dims[1];
+                            kH = p->inputs[1]->dims[2];
+                            kW = p->inputs[1]->dims[3];
+                        }
+                        snprintf(tail_info, sizeof(tail_info),
+                                 " prod='%.*s' op='%.*s' accepted=%d "
+                                 "iC=%d (iC%%blk=%d) oC=%d (oC%%blk=%d) k=%dx%d",
+                                 (int)prod_name_len, prod_name,
+                                 (int)p->op_type.size(), p->op_type.data(),
+                                 (int)accepted[prod_idx],
+                                 ic, ic >= 0 ? ic % block : -1,
+                                 oc, oc >= 0 ? oc % block : -1,
+                                 kH, kW);
+                    }
+                }
+                fprintf(stderr,
+                    "[nchwc] fwdlook: chain root=%d not promoted (%s, "
+                    "concat='%.*s', blocking_input='%.*s'%s)\n",
+                    root, d.reason,
+                    (int)concat_name_len, concat_name,
+                    (int)blk_name_len, blk_name,
+                    tail_info);
+            }
+        }
     }
 
     if (debug_layout) {
@@ -311,6 +589,11 @@ void assign_blocked_layouts(context_t* ctx)
     // Don't set format yet — the data is still NCHW from the first run.
     // reset_formats() will set the format when the plan is built and a
     // proper run produces blocked data.
+    //
+    // T3 M1 step 3c — also write declared_layout = NATIVE_BLOCKED_FMT so
+    // insert_reorders.cpp can query intended layouts BEFORE first run /
+    // reset_formats. This is type-checked path — declared_layout commits
+    // synchronously here even though `format` propagates lazily.
     auto& blocked_tensors = ctx->optimizer->blocked_tensors;
     std::unordered_set<tensor_t*> seen;
     for (int i = 0; i < n; ++i) {
@@ -319,7 +602,135 @@ void assign_blocked_layouts(context_t* ctx)
             if (t && t->ndim == 4 && t->type == NNR_DATA_TYPE_FLOAT32
                 && t->dims[1] % block == 0 && !seen.count(t)) {
                 blocked_tensors.push_back(t);
+                t->declared_layout = NATIVE_BLOCKED_FMT;  // T3 M1 step 3c
                 seen.insert(t);
+            }
+        }
+    }
+
+    // Phase 4.5: extend BLOCKED through eligible Concat ops.
+    // When every Concat input is already a BLOCKED tensor and the byte layout
+    // matches under c-block storage (axis=0, or axis=1 with N=1 + C divisible
+    // by block), the Concat output keeps the BLOCKED format. memory_planner
+    // can then nullify the Concat by aliasing inputs into the output buffer.
+    // The Concat fallback exec_impl is just memcpy, which produces correct
+    // BLOCKED output bytes for these cases, so a non-aliased fallback is safe.
+    // Iterate to a fixed point so Concat-of-Concat chains propagate.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < n; ++i) {
+            auto* nd = nodes[i];
+            if (nd->op_type != "Concat") continue;
+            if (nd->skip || nd->folded) continue;
+            if (nd->inputs.empty() || nd->outputs.empty()) continue;
+            auto* y = nd->outputs[0];
+            if (!y || y->ndim != 4 || y->type != NNR_DATA_TYPE_FLOAT32) continue;
+            if (seen.count(y)) continue;
+            if (y->dims[1] % block != 0) continue;
+            int axis = nd->attribute("axis", (int32_t)0);
+            if (axis < 0) axis += y->ndim;
+            if (axis != 0 && axis != 1) continue;
+            if (axis == 1 && y->dims[0] != 1) continue;
+            bool all_in = true;
+            for (auto* in : nd->inputs) {
+                if (!in) { all_in = false; break; }
+                // Walk back through skip/folded transparent ops (e.g.,
+                // Conv→Relu(skip)→Concat). Phase 4 only registered raw Conv
+                // outputs in `seen`; without this walk, fused-Relu Concats
+                // never get extended and downstream alias rejects on
+                // layout_mismatch.
+                tensor_t* src = in;
+                for (int hop = 0; hop < 8; ++hop) {
+                    if (seen.count(src)) break;
+                    auto pit = tensor_producer.find(src);
+                    if (pit == tensor_producer.end()) break;
+                    auto* p_nd = nodes[pit->second];
+                    if (!(p_nd->skip || p_nd->folded)) break;
+                    if (p_nd->inputs.empty() || !p_nd->inputs[0]) break;
+                    src = p_nd->inputs[0];
+                }
+                if (!seen.count(src)) { all_in = false; break; }
+                if (axis == 1 && src->dims[1] % block != 0) { all_in = false; break; }
+            }
+            if (!all_in) continue;
+            blocked_tensors.push_back(y);
+            y->declared_layout = NATIVE_BLOCKED_FMT;  // T3 M1 step 3c (Phase 4.5)
+            seen.insert(y);
+            changed = true;
+        }
+    }
+
+    // Phase 4.55: propagate BLOCKED through skip/folded post-op-fused ops
+    // (Conv-fused Relu/Clip/Sigmoid/Tanh/LeakyRelu/Elu/BN). Their output
+    // tensor is a SEPARATE tensor_t from input even though their data
+    // pointers alias at runtime — so the input's declared_layout = BLOCKED
+    // doesn't automatically reach the output. Without this, downstream
+    // Conv::scroll_info sees the consumer's input declared NCHW and
+    // rejects the chain. Whitelisted by op_type to avoid touching ops
+    // that change shape/dtype (Reshape/Cast/Squeeze/...).
+    auto is_post_op_fused = [](std::string_view t) {
+        return t == "Relu" || t == "Clip" || t == "Sigmoid"
+            || t == "Tanh" || t == "LeakyRelu" || t == "Elu"
+            || t == "BatchNormalization";
+    };
+    // Phase 4.55 + 4.6 share an outer fixed-point. Without it, an active
+    // Conv→Add→Relu chain stalls because Phase 4.55 visits Relu before
+    // Phase 4.6 marks Add's output BLOCKED, and Relu's output is left NCHW.
+    // Looping both passes together lets Add→Relu fan-out propagate cleanly.
+    {
+        bool outer_changed = true;
+        while (outer_changed) {
+            outer_changed = false;
+
+            // Phase 4.55: skip/folded + active post-op-fused unary ops
+            // (element-wise on flat data, BLOCKED passes through unchanged).
+            for (int i = 0; i < n; ++i) {
+                auto* nd = nodes[i];
+                if (!is_post_op_fused(nd->op_type)) continue;
+                if (nd->inputs.empty() || nd->outputs.empty()) continue;
+                auto* x = nd->inputs[0];
+                auto* y = nd->outputs[0];
+                if (!x || !y) continue;
+                if (y->ndim != 4 || y->type != NNR_DATA_TYPE_FLOAT32) continue;
+                if (seen.count(y)) continue;
+                if (!seen.count(x)) continue;
+                if (y->dims[1] % block != 0) continue;
+                blocked_tensors.push_back(y);
+                y->declared_layout = NATIVE_BLOCKED_FMT;
+                seen.insert(y);
+                outer_changed = true;
+            }
+
+            // Phase 4.6: active binary same-shape (Add/Mul/Sub/Div) + active BN.
+            for (int i = 0; i < n; ++i) {
+                auto* nd = nodes[i];
+                if (nd->skip || nd->folded) continue;
+                if (nd->inputs.empty() || nd->outputs.empty()) continue;
+                std::string_view t = nd->op_type;
+                const bool is_binary = (t == "Add" || t == "Mul"
+                                     || t == "Sub" || t == "Div");
+                const bool is_bn = (t == "BatchNormalization");
+                if (!is_binary && !is_bn) continue;
+                auto* y = nd->outputs[0];
+                if (!y || y->ndim != 4 || y->type != NNR_DATA_TYPE_FLOAT32) continue;
+                if (seen.count(y)) continue;
+                if (y->dims[1] % block != 0) continue;
+                bool all_in = true;
+                const int n_check = is_binary ? 2 : 1;
+                for (int k = 0; k < n_check && k < (int)nd->inputs.size(); ++k) {
+                    auto* in = nd->inputs[k];
+                    if (!in) { all_in = false; break; }
+                    if (in->ndim != 4 || in->type != NNR_DATA_TYPE_FLOAT32) {
+                        all_in = false; break;
+                    }
+                    if (!seen.count(in)) { all_in = false; break; }
+                }
+                if (!all_in) continue;
+                blocked_tensors.push_back(y);
+                y->declared_layout = NATIVE_BLOCKED_FMT;
+                seen.insert(y);
+                outer_changed = true;
             }
         }
     }

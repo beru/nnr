@@ -31,6 +31,7 @@ void decompose_ops(context_t* ctx);
 void fuse_conv_bn(context_t* ctx);
 void fuse_pad(context_t* ctx);
 void fuse_post_ops(context_t* ctx);
+void fuse_post_ops_silu(context_t* ctx);
 void fold_bn_qdq(context_t* ctx);
 void fuse_qdq_compute(context_t* ctx);
 void fuse_qdq(context_t* ctx);
@@ -38,10 +39,14 @@ void fuse_silu(context_t* ctx);
 void fuse_layer_norm(context_t* ctx);
 void fuse_gelu(context_t* ctx);
 void fuse_sdpa(context_t* ctx);
+void fuse_webgpu_elementwise(context_t* ctx);
+void fuse_webgpu_matmul_chain(context_t* ctx);
 void fold_constants(context_t* ctx);
 void detect_scroll_chains(graph_optimizer_t* opt, context_t* ctx);
 void assign_layouts(context_t* ctx);
 void assign_blocked_layouts(context_t* ctx);
+void insert_reorders(context_t* ctx);
+void cancel_reorders(context_t* ctx);
 void optimize_transposes(context_t* ctx);
 
 } // namespace nnr

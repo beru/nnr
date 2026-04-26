@@ -154,21 +154,30 @@ inline void copy_row_avx2(float* __restrict dst, const float* __restrict src, in
     }
 }
 
-// Copy exactly JBLK (32) floats — no branch, 4 full ymm stores.
+// Copy exactly JBLK (64) floats — no branch, 8 full ymm stores. Matches the
+// pack_b_size / dgemm_packed_b JBLK=64 convention so the panel stride a
+// reader expects (`pp + k * 64`) lines up with what pack writes.
 // @nnr-meta isa=AVX2 dtype=fp32
 inline void copy_row_avx2_full(float* __restrict dst, const float* __restrict src) {
     _mm256_storeu_ps(dst,      _mm256_loadu_ps(src));
     _mm256_storeu_ps(dst + 8,  _mm256_loadu_ps(src + 8));
     _mm256_storeu_ps(dst + 16, _mm256_loadu_ps(src + 16));
     _mm256_storeu_ps(dst + 24, _mm256_loadu_ps(src + 24));
+    _mm256_storeu_ps(dst + 32, _mm256_loadu_ps(src + 32));
+    _mm256_storeu_ps(dst + 40, _mm256_loadu_ps(src + 40));
+    _mm256_storeu_ps(dst + 48, _mm256_loadu_ps(src + 48));
+    _mm256_storeu_ps(dst + 56, _mm256_loadu_ps(src + 56));
 }
 
 // 2D B-panel copy: kc rows of jw floats from src (stride src_stride) into
-// dst (stride JBLK). Branch on full vs partial row is hoisted outside the loop.
+// dst (stride JBLK=64). Branch on full vs partial row is hoisted outside
+// the loop. JBLK matches the AVX-2 dgemm_packed_b reader's stride
+// (`pp + k * JBLK`). Earlier versions used JBLK=32 here while the reader
+// used 64, silently corrupting AVX-2 packed GEMM (latent on AVX-512 boxes).
 // @nnr-meta isa=AVX2 dtype=fp32
 NNR_NOINLINE inline void pack_b_panel_avx2(float* __restrict dst, const float* __restrict src,
                               int kc, int jw, int src_stride) {
-    constexpr int JBLK = 32;
+    constexpr int JBLK = 64;
     if (jw == JBLK) {
         for (int k = 0; k < kc; ++k)
             copy_row_avx2_full(dst + (size_t)k * JBLK, src + (size_t)k * src_stride);
@@ -781,11 +790,13 @@ inline void pack_b(float* __restrict dst, const float* __restrict B, int o, int 
 template <typename PostFn>
 // @nnr-meta isa=AVX2 dtype=fp32 special=GEMM tiling=[K,MR,NR] fusion=post_op
 inline void dgemm_packed_b(int n, int m, int o, const float* __restrict A,
-    const float* __restrict packed_B, float* __restrict C, const PostFn& post_fn)
+    const float* __restrict packed_B, float* __restrict C, const PostFn& post_fn,
+    int ldc = 0)
 {
     constexpr bool can_fuse = PostFn::per_row_bias;
     constexpr int JBLK = 64;
     constexpr int KC = 256;
+    if (ldc == 0) ldc = m;
     int nj = (m + JBLK - 1) / JBLK;
     int nk = (o + KC - 1) / KC;
     int ni = (n + JBLK - 1) / JBLK;
@@ -823,7 +834,7 @@ inline void dgemm_packed_b(int n, int m, int o, const float* __restrict A,
                 float* pc[6];
                 for (int r = 0; r < 6; r++) {
                     pa[r] = A + (size_t)(i + r) * o + k0;
-                    pc[r] = C + (size_t)(i + r) * m;
+                    pc[r] = C + (size_t)(i + r) * ldc;
                 }
                 #if 0 // LOCUST
 ;                gen_pack_a_6(4)
@@ -857,7 +868,7 @@ inline void dgemm_packed_b(int n, int m, int o, const float* __restrict A,
                 }
             }
             for (; i < ie; i++) {
-                float* pci = C + (size_t)i * m;
+                float* pci = C + (size_t)i * ldc;
                 const float* pai = A + (size_t)i * o + k0;
                 int v = j0;
                 for (; v + 8 <= je; v += 8) {
@@ -886,7 +897,7 @@ inline void dgemm_packed_b(int n, int m, int o, const float* __restrict A,
             }
         }
         if (!(can_fuse && post_fn.kind != post_op_kind::none))
-            post_fn.apply_rows(i0, ie, C, m, j0, jw);
+            post_fn.apply_rows(i0, ie, C, ldc, j0, jw);
     });
 }
 
@@ -959,7 +970,7 @@ inline void dgemm_packed_a(int n, int m, int o, const float* __restrict packed_A
     const bool prepack_b = (nj == 1 && m < JBLK);
     if (prepack_b) {
         size_t total = (size_t)nk * KC * JBLK;
-        shared_pb = (float*)_aligned_malloc(total * sizeof(float), 64);
+        shared_pb = (float*)nnr_aligned_alloc(total * sizeof(float), 64);
         if (shared_pb) {
             int jw = m;
             for (int kt = 0; kt < nk; kt++) {
@@ -1111,7 +1122,7 @@ inline void dgemm_packed_a(int n, int m, int o, const float* __restrict packed_A
             post_fn.apply_rows(i0, ie, C, m, j0, jw);
     });
 
-    if (shared_pb) _aligned_free(shared_pb);
+    if (shared_pb) nnr_aligned_free(shared_pb);
 }
 
 // Batched GEMM for Winograd: performs 36 independent GEMMs sharing dispatch/threading.
@@ -1281,11 +1292,20 @@ inline void dgemm_packed_a_batch36(
 template <typename PostFn>
 // @nnr-meta isa=AVX2 dtype=fp32 layout=NHWC special=GEMM tiling=[K,MR,NR] fusion=post_op
 inline void dgemm_nhwc(int n, int m, int o, const float* __restrict A,
-    const float* __restrict packed_B, float* __restrict C, const PostFn& post_fn)
+    const float* __restrict packed_B, float* __restrict C, const PostFn& post_fn,
+    int ldc = 0)
 {
     constexpr int JBLK = 64;
     constexpr int KC = 256;
     constexpr int IBLK = 64;
+    if (ldc == 0) ldc = m;
+    // Strided dst (NHWC concat alias): the C-hot inline-store path uses `* m`
+    // arithmetic. Route to dgemm_packed_b which builds row pointers explicitly
+    // and honors ldc. See AVX-512 sibling for the same trade-off.
+    if (ldc != m) {
+        avx2::dgemm_packed_b(n, m, o, A, packed_B, C, post_fn, ldc);
+        return;
+    }
     int nj = (m + JBLK - 1) / JBLK;
     int nk = (o + KC - 1) / KC;
     int ni = (n + IBLK - 1) / IBLK;

@@ -85,6 +85,11 @@ struct Relu_operator : public operator_t {
 
     scroll_info_t scroll_info() const override {
         if (inputs[0]->ndim < 3) return {};
+        // Ring buffer is sized using x's declared_layout; exec_strip must
+        // address y with the same per-channel-block stride. Bail on
+        // mismatch — whole-tensor exec is layout-agnostic.
+        if (outputs.empty() || !outputs[0]) return {};
+        if (inputs[0]->declared_layout != outputs[0]->declared_layout) return {};
         return { .scrollable = true };
     }
 
@@ -96,18 +101,26 @@ struct Relu_operator : public operator_t {
         if (x->ndim < 3) return false;
         int iH = x->dims[x->ndim - 2];
         int W  = x->dims[x->ndim - 1];
-        int outer = (int)(x->ndata / (iH * W));
         int oH = y->dims[y->ndim - 2];
         int clamp_H = ring_out.orig_H > 0 ? ring_out.orig_H : oH;
         int out_end = std::min(out_row_start + out_rows, clamp_H);
-        int count = (out_end - out_row_start) * W;
-        if (count <= 0) return true;
+        int rows = out_end - out_row_start;
+        if (rows <= 0) return true;
+        // BLOCKED layout interleaves block channels per spatial step; row
+        // stride per channel block is W*block, outer iteration is N*(C/block).
+        bool blocked = (y->declared_layout == NATIVE_BLOCKED_FMT);
+        int block = blocked ? NATIVE_BLOCK : 1;
+        int row_elems = W * block;
+        int outer = blocked
+            ? (int)(x->ndata / (iH * row_elems))
+            : (int)(x->ndata / (iH * W));
+        int count = rows * row_elems;
         const float* px = (const float*)x->data;
         float* py = (float*)y->data;
         dispatch_clip([&](auto clip_fn) {
             nnr::for_static(0, outer, outer > 4, [&](int nc) {
-                const float* src = px + (size_t)nc * iH * W + (size_t)out_row_start * W;
-                float* dst = py + (size_t)nc * oH * W + (size_t)out_row_start * W;
+                const float* src = px + (size_t)nc * iH * row_elems + (size_t)out_row_start * row_elems;
+                float* dst = py + (size_t)nc * oH * row_elems + (size_t)out_row_start * row_elems;
                 clip_fn(src, dst, count);
             });
         });

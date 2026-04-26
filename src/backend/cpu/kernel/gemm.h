@@ -18,6 +18,7 @@
 #include "backend/arm/vec_ops_neon.h"
 #include "backend/arm/gemm_neon.h"
 #include "backend/arm/conv_neon.h"
+#include "backend/arm/gemm_fp16_neon.h"
 #endif
 
 namespace nnr {
@@ -205,11 +206,46 @@ struct gemm_post_nhwc_t {
     }
 };
 
+// LDC overload of dgemm_generic: same semantics as dgemm_generic, but the
+// output `C` has row stride `ldc` (in elements) instead of `m`. Used when a
+// producer Conv writes directly into an NHWC channel-Concat parent buffer
+// whose inner dim is wider than this producer's local channel count.
+//
+// Fast path (ldc == m): forwards to dgemm_generic so the ISA-tiled kernels
+// stay reachable. Strided path (ldc != m): scalar reference until M2/M3
+// teach the AVX-512/AVX-2/NEON dgemm kernels to honor LDC. M1 only ships
+// the API surface; no caller passes ldc != m yet.
+template <typename T, typename PostFn = gemm_post_t>
+inline void dgemm_generic(int n, int m, int o, const T* __restrict A, const T* __restrict B, T* __restrict C, const PostFn& post_fn = PostFn{});
+
+template <typename T, typename PostFn = gemm_post_t>
+inline void dgemm_generic_ldc(int n, int m, int o, const T* __restrict A, const T* __restrict B, T* __restrict C, int ldc, const PostFn& post_fn = PostFn{})
+{
+    if (ldc == m) {
+        dgemm_generic<T, PostFn>(n, m, o, A, B, C, post_fn);
+        return;
+    }
+    NNR_PROFILE_SCOPE("dgemm_generic_ldc");
+    // Scalar reference for strided output. K-tiling is unnecessary here
+    // because LDC != M is rare (only NHWC concat-aliased producers).
+    for (int i = 0; i < n; ++i) {
+        T* row = C + (size_t)i * ldc;
+        for (int j = 0; j < m; ++j) {
+            T sum = T(0);
+            for (int k = 0; k < o; ++k)
+                sum += A[(size_t)i * o + k] * B[(size_t)k * m + j];
+            row[j] = sum;
+        }
+        if constexpr (std::is_same_v<T, float>)
+            post_fn.apply(i, (float*)row, m);
+    }
+}
+
 // Unified GEMM kernel: C[n×m] = A[n×o] × B[o×m]
 // A is row-major [n×o], B is row-major [o×m], C is row-major [n×m].
 // post_fn.apply(row, data, len) is called per-row on L1-hot tile data.
-template <typename T, typename PostFn = gemm_post_t>
-inline void dgemm_generic(int n, int m, int o, const T* __restrict A, const T* __restrict B, T* __restrict C, const PostFn& post_fn = PostFn{})
+template <typename T, typename PostFn>
+inline void dgemm_generic(int n, int m, int o, const T* __restrict A, const T* __restrict B, T* __restrict C, const PostFn& post_fn)
 {
     NNR_PROFILE_SCOPE("dgemm_generic");
     if constexpr (std::is_same_v<T, float>) {
@@ -334,41 +370,109 @@ inline void pack_b(float* dst, const float* B, int o, int m) {
 #endif
 }
 
+// True when the dispatch wrapper can honor a non-default ldc with the
+// pre-packed B fast path. AVX-512 + AVX-2 supported on x64 (after the
+// pack_b_panel_avx2 JBLK=32→64 fix); NEON still uses the scalar
+// dgemm_generic_ldc fallback on ARM.
+inline bool dgemm_packed_supports_ldc() {
+#ifdef NNR_ARCH_X64
+    return true;
+#else
+    return false;
+#endif
+}
+
 // GEMM with pre-packed B panels. packed_B must be created by pack_b().
+//
+// `ldc` is the row stride of C in elements; default 0 means "= m" (contiguous).
+// AVX-512 + AVX-2 honor ldc directly. NEON: ldc must be 0 or = m (caller
+// responsibility — check dgemm_packed_supports_ldc()).
 template <typename PostFn = gemm_post_t>
-inline void dgemm_packed_b(int n, int m, int o, const float* A, const float* packed_B, float* C, const PostFn& post_fn = {}) {
+inline void dgemm_packed_b(int n, int m, int o, const float* A, const float* packed_B,
+                           float* C, const PostFn& post_fn = {}, int ldc = 0) {
     NNR_PROFILE_SCOPE("dgemm_packed_b");
 #ifdef NNR_ARCH_X64
-    if (has_avx512())
-        avx512::dgemm_packed_b(n, m, o, A, packed_B, C, post_fn);
-    else if (detect_isa() == isa_t::avx2)
-        avx2::dgemm_packed_b(n, m, o, A, packed_B, C, post_fn);
+    if (has_avx512()) {
+        avx512::dgemm_packed_b(n, m, o, A, packed_B, C, post_fn, ldc);
+        return;
+    }
+    if (detect_isa() == isa_t::avx2) {
+        avx2::dgemm_packed_b(n, m, o, A, packed_B, C, post_fn, ldc);
+        return;
+    }
 #elifdef NNR_ARCH_ARM64
-    if (has_neon())
+    if (has_neon()) {
+        assert((ldc == 0 || ldc == m) && "neon packed_b doesn't support ldc != m");
         neon::dgemm_packed_b(n, m, o, A, packed_B, C, post_fn);
+        return;
+    }
 #endif
+    (void)ldc;
+}
+
+// FP16 GEMM with pre-packed B. FP16 inputs (uint16_t bit pattern), FP32 output.
+// Caller is responsible for any FP32→FP16 conversion of C. Returns false when
+// no FP16 hardware path is available; the caller should then fall back to the
+// convert-to-FP32 path.
+inline size_t pack_b_fp16_size(int o, int m) {
+#ifdef NNR_ARCH_ARM64
+    if (has_neon_fp16())
+        return nnr::fp16::neon::pack_b_fp16_neon_size(o, m);
+#else
+    (void)o; (void)m;
+#endif
+    return 0;
+}
+
+inline void pack_b_fp16(uint16_t* dst, const uint16_t* B, int o, int m) {
+    NNR_PROFILE_SCOPE("pack_b_fp16");
+#ifdef NNR_ARCH_ARM64
+    if (has_neon_fp16())
+        nnr::fp16::neon::pack_b_fp16_neon(dst, B, o, m);
+#else
+    (void)dst; (void)B; (void)o; (void)m;
+#endif
+}
+
+inline bool dgemm_fp16(int n, int m, int o,
+                      const uint16_t* A, const uint16_t* packed_B, float* C) {
+    NNR_PROFILE_SCOPE("dgemm_fp16");
+#ifdef NNR_ARCH_ARM64
+    if (has_neon_fp16())
+        return nnr::fp16::neon::gemm_fp16_neon(n, m, o, A, packed_B, C);
+#else
+    (void)n; (void)m; (void)o; (void)A; (void)packed_B; (void)C;
+#endif
+    return false;
 }
 
 // NHWC-native GEMM with pre-packed B. packed_B must be created by pack_b().
 // Optimized loop ordering for NHWC Conv: tiles spatial only, B stays L1-hot.
+//
+// `ldc` (default 0 → m): see dgemm_packed_b. AVX-512 + AVX-2 internally route
+// to dgemm_packed_b when ldc != m. NEON: caller responsibility (route to
+// dgemm_generic_ldc with unpacked weights when ldc != m).
 template <typename PostFn = gemm_post_t>
-inline void dgemm_nhwc(int n, int m, int o, const float* A, const float* packed_B, float* C, const PostFn& post_fn = {}) {
+inline void dgemm_nhwc(int n, int m, int o, const float* A, const float* packed_B,
+                       float* C, const PostFn& post_fn = {}, int ldc = 0) {
     NNR_PROFILE_SCOPE("dgemm_nhwc");
 #ifdef NNR_ARCH_X64
-    if (has_avx512())
-        avx512::dgemm_nhwc(n, m, o, A, packed_B, C, post_fn);
-    else if (detect_isa() == isa_t::avx2)
-        avx2::dgemm_nhwc(n, m, o, A, packed_B, C, post_fn);
-    else
-        dgemm_packed_b(n, m, o, A, packed_B, C, post_fn); // fallback
+    if (has_avx512()) {
+        avx512::dgemm_nhwc(n, m, o, A, packed_B, C, post_fn, ldc);
+        return;
+    }
+    if (detect_isa() == isa_t::avx2) {
+        avx2::dgemm_nhwc(n, m, o, A, packed_B, C, post_fn, ldc);
+        return;
+    }
 #elifdef NNR_ARCH_ARM64
-    if (has_neon())
+    if (has_neon()) {
+        assert((ldc == 0 || ldc == m) && "neon dgemm_nhwc doesn't support ldc != m");
         neon::dgemm_nhwc(n, m, o, A, packed_B, C, post_fn);
-    else
-        dgemm_packed_b(n, m, o, A, packed_B, C, post_fn); // fallback
-#else
-    dgemm_packed_b(n, m, o, A, packed_B, C, post_fn); // fallback
+        return;
+    }
 #endif
+    dgemm_packed_b(n, m, o, A, packed_B, C, post_fn, ldc); // fallback
 }
 
 // Batched GEMM for Winograd: performs 36 independent GEMMs in a single dispatch.

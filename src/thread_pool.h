@@ -17,6 +17,7 @@
 // are pulled in and no worker threads are created.
 
 #include "cpu_features.h"  // always needed (defines NNR_ARCH_X64 / NNR_ARCH_ARM64)
+#include "nnrconf.h"       // _aligned_malloc/_aligned_free polyfill on non-Windows
 
 #ifndef NNR_NO_THREAD_POOL // full multi-threaded implementation below
 
@@ -38,6 +39,7 @@
 #include <cstring>
 #include <memory>
 #include "cpu_features.h"
+#include "aligned_alloc.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -199,8 +201,8 @@ public:
     void ensure_scratch(size_t bytes) {
         if (bytes <= scratch_size_) return;
         for (int i = 0; i < nthreads_; ++i) {
-            _aligned_free(scratch_[i]);
-            scratch_[i] = _aligned_malloc(bytes, 64);
+            nnr_aligned_free(scratch_[i]);
+            scratch_[i] = nnr_aligned_alloc(bytes, 64);
         }
         scratch_size_ = bytes;
     }
@@ -237,8 +239,11 @@ private:
     int task_end_ = 0;
     int task_nactive_ = 0;
     int nwoken_ = 0;
-    unsigned dispatch_epoch_ = 0;
-    bool exit_ = false;
+    // exit_ / dispatch_epoch_ are atomic: both are read by workers concurrently
+    // with main-thread writes. Plain-type reads across threads are a C++ data
+    // race (UB) and TSan flags them; x86 TSO papers over it in practice.
+    std::atomic<unsigned> dispatch_epoch_{0};
+    std::atomic<bool> exit_{false};
 
     alignas(64) std::atomic<int> startup_count_{0};
     alignas(64) std::atomic<int> dynamic_counter_{0};
@@ -403,7 +408,20 @@ private:
 
     ~thread_pool_t() {
         if (nworkers_ > 0) {
-            exit_ = true;
+            // Wait for the last dispatch's workers to finish before tearing down.
+            // dispatch() already barrier-waits workers [1..nwoken_); this is a
+            // defensive no-op in well-formed code that closes process-exit
+            // races where a worker is still mid-store in worker_done_ or
+            // otherwise touching shared state (scratch, task_ctx_) when the
+            // Meyers singleton dtor runs.
+            unsigned last_epoch = dispatch_epoch_.load(std::memory_order_acquire);
+            if (last_epoch > 0) {
+                for (int t = 1; t < nwoken_; ++t) {
+                    while (worker_done_[t - 1].epoch.load(std::memory_order_acquire) < last_epoch)
+                        POOL_SPIN_PAUSE();
+                }
+            }
+            exit_.store(true, std::memory_order_release);
             for (int g = 0; g < ngroups_; ++g)
                 groups_[g].gen.store(UINT_MAX, std::memory_order_release);
             // Wake all workers (MONITORX workers may be in WaitOnAddress fallback)
@@ -422,7 +440,7 @@ private:
             threads_.clear();
         }
         for (int i = 0; i < nthreads_; ++i)
-            _aligned_free(scratch_[i]);
+            nnr_aligned_free(scratch_[i]);
         if (trace_fp_ && trace_fp_owned_) std::fclose(trace_fp_);
     }
 
@@ -512,7 +530,7 @@ private:
             }
 
             my_gen = gen;
-            if (exit_) return;
+            if (exit_.load(std::memory_order_acquire)) return;
 
             if (tid < task_nactive_) {
                 work_fn_(this, tid);
@@ -521,8 +539,12 @@ private:
                 idle_count = std::min(idle_count + 1, IDLE_RAMPDOWN);
             }
 
-            // Sense-reversing: each worker writes only its own cache line (zero contention)
-            worker_done_[tid - 1].epoch.store(dispatch_epoch_, std::memory_order_release);
+            // Sense-reversing: each worker writes only its own cache line (zero contention).
+            // dispatch_epoch_ was released by main prior to the gen increment that woke us,
+            // so the acquire load below sees the value paired with this dispatch.
+            worker_done_[tid - 1].epoch.store(
+                dispatch_epoch_.load(std::memory_order_acquire),
+                std::memory_order_release);
         }
     }
 
@@ -572,7 +594,9 @@ private:
         task_end_ = end;
         task_nactive_ = nactive;
         nwoken_ = nwoken;
-        unsigned epoch = ++dispatch_epoch_;
+        // acq_rel so workers observe the new dispatch_epoch_ when they acquire
+        // the following gen increment; the barrier below acquires this value.
+        unsigned epoch = dispatch_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (dynamic) {
             work_fn_ = &work_impl<Fn, true>;
             dynamic_counter_.store(begin, std::memory_order_relaxed);

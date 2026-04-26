@@ -20,8 +20,7 @@ struct SequenceAt_operator : public operator_t {
 
         const tensor_t* src = seq->tensors[idx];
         if (!src) return false;
-        outputs[0]->apply(*src);
-        return true;
+        return outputs[0]->apply(*src);
     }
 };
 

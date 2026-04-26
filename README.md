@@ -1,17 +1,18 @@
 # NNR
 
-Lightweight neural network inference runtime. Loads ONNX and TFLite models and runs them on CPU with no external dependencies.
+Lightweight neural network inference runtime. Loads ONNX and TFLite models and runs them on CPU (x64/ARM64) or NVIDIA GPU with no external dependencies.
 
-Intended as a **readable baseline** for embedded developers porting inference to less mainstream CPUs — not a drop-in competitor to ORT/MNN/ncnn on flagship hardware. Kernels live in plain C++20 headers per ISA (`backend/x64/`, `backend/arm/`); adding a new backend is mostly writing one kernel file and wiring it into the dispatch switch. Zero runtime dependencies keeps the port surface small.
+Intended as a **readable baseline** for embedded developers porting inference to less mainstream CPUs — not a drop-in competitor to ORT/MNN/ncnn on flagship hardware. Kernels live in plain C++20 headers per ISA (`backend/x64/`, `backend/arm/`, `backend/gpu/cuda/`); adding a new backend is mostly writing one kernel file and wiring it into the dispatch switch. Zero runtime dependencies keeps the port surface small.
 
 ## Features
 
 - **Formats**: ONNX (custom protobuf parser) and TFLite (hand-rolled FlatBuffer reader). 203 ONNX operators across opset 1–22.
 - **x64 kernels**: AVX-512 and AVX2. Tiled GEMM, direct/im2col convolution, Winograd F(2×2,3×3) and F(4×4,3×3) in both NCHW and NCHWc layouts, depthwise/grouped convolution. Int8 via VNNI (VPDPBUSD) with QLinearConv/MatMul fast paths. JIT micro-kernels via Xbyak for specialized shapes.
 - **ARM64 kernels**: NEON GEMM, Winograd, depthwise/pointwise/first-layer/last-layer convolutions. Fp16 compute, int8 dot-product. JIT via Xbyak_aarch64.
+- **CUDA backend** (`-DNNR_USE_CUDA=ON`): 93 operators on NVIDIA GPUs. WMMA TensorCore GEMM (TF32 fp32, signed-int8 with shift-by-−128 unification), cp.async double-buffered tiles, fused epilogues, depthwise/grouped Conv, per-tensor device residency cache, CUDA Graph capture/replay (~100× lower launch overhead for small-kernel models). NVRTC runtime compilation — no offline `nvcc` step.
 - **Graph optimizer**: Conv+BN fusion, post-op fusion (Relu/Sigmoid/Clip/HardSwish/Add), QDQ fusion for int8 paths, cost-based layout selection across NCHW/NHWC/NCHWc, constant folding, operator decomposition, transpose cancellation.
 - **Runtime**: work-stealing thread pool (per-core run queues, adaptive spin + MONITORX/MWAITX on AMD), tensor pool with in-place optimization and lifetime analysis, zero heap allocation during inference, runtime CPU cache-topology detection (L1d/L2/L3-per-domain) feeding backend block-size and workspace budgets.
-- **Distribution**: no external runtime dependencies (no protobuf, no flatbuffers, no BLAS, no ONNX Runtime). Only Xbyak/Xbyak_aarch64 as header-only JIT assemblers via submodule, and enchantum as a header-only enum reflection library.
+- **Distribution**: no external runtime dependencies (no protobuf, no flatbuffers, no BLAS, no ONNX Runtime, no cuBLAS, no cuDNN). Only Xbyak/Xbyak_aarch64 as header-only JIT assemblers via submodule, and enchantum as a header-only enum reflection library, and the CUDA Toolkit (runtime + NVRTC + driver API) when CUDA is enabled.
 
 ## Build
 
@@ -20,12 +21,16 @@ Intended as a **readable baseline** for embedded developers porting inference to
 git clone --recurse-submodules <repo-url>
 cd nnr
 
-# Configure + build
+# Configure + build (CPU only)
 cmake -S . -B build
+cmake --build build --config Release
+
+# Configure + build with CUDA backend (requires CUDA Toolkit 12+)
+cmake -S . -B build -DNNR_USE_CUDA=ON
 cmake --build build --config Release
 ```
 
-Requires CMake 3.16+ and a C++20 compiler (MSVC 2022, GCC 12+, Clang 15+).
+Requires CMake 3.16+ and a C++20 compiler (MSVC 2022, GCC 12+, Clang 15+). CUDA backend additionally requires the CUDA Toolkit (runtime headers + NVRTC); compiles for `sm_75` and up.
 
 ## Project layout
 
@@ -43,6 +48,8 @@ src/
   backend/cpu/kernel/      ISA-dispatch wrappers (pool, gemm, etc.)
   backend/x64/             AVX-512/AVX2 kernels, JIT (Xbyak)
   backend/arm/             NEON kernels
+  backend/gpu/             Device abstraction, per-tensor residency cache
+  backend/gpu/cuda/        CUDA ops, NVRTC kernel cache, WMMA GEMM, graph replay
 third_party/
   xbyak/                   x64 JIT assembler (submodule)
   xbyak_aarch64/           ARM64 JIT assembler (submodule)

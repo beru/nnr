@@ -463,6 +463,14 @@ struct Cast_operator : public operator_t {
         tensor_t* y = outputs[0];
         data_type_t type = x->type;
 
+        // Re-derive y's shape from x's live dims — an upstream
+        // NonMaxSuppression can shrink x->dims during exec(), and the
+        // fast path skips reshape(). Without this, y->ndata stays at the
+        // prepare-time upper bound and Cast_array reads past x->data
+        // (yolov3-tiny NMS→Unsqueeze→Cast crash).
+        if (x->ndata != y->ndata)
+            if (!reshape()) return false;
+
         // Float4/Float8 source: decode first, then cast
         if (type == NNR_DATA_TYPE_FLOAT8E4M3FN || type == NNR_DATA_TYPE_FLOAT8E4M3FNUZ
          || type == NNR_DATA_TYPE_FLOAT8E5M2 || type == NNR_DATA_TYPE_FLOAT8E5M2FNUZ

@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cinttypes>
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "layout_cost.h"
 #include "registry.h"
+#include "backend/cpu/solve_operator.h"
 #include "graph_optimizer.h"
 #include "backend/cpu/util.h"
 #include "backend/cpu/kernel/layout.h"
@@ -14,6 +16,14 @@
 #include "thread_pool.h"
 #include "trace.h"
 #include "no_popup.h"
+#if defined(NNR_USE_CUPTI)
+#include "backend/gpu/cuda/cupti_profiler.h"
+#endif
+
+#ifdef NNR_ENABLE_WEBGPU
+#include "backend/webgpu/buffer.h"
+#include "backend/webgpu/profiler.h"
+#endif
 
 #ifdef _WIN32
 #include <sys/stat.h>
@@ -101,9 +111,9 @@ int operator_t::attribute(attr_key_t key, tensor_t* t)
         tensor_t* src = a->tensor;
         if (t->type != src->type || t->ndim != src->ndim ||
             memcmp(t->dims, src->dims, src->ndim * sizeof(int)) != 0) {
-            t->reinit(src->type, src->dim_span());
+            if (!t->reinit(src->type, src->dim_span())) return 0;
         }
-        t->apply(*src);
+        if (!t->apply(*src)) return 0;
         return 1;
     }
     return 0;
@@ -149,7 +159,7 @@ sequence_t::~sequence_t()
 // tensor_t
 // ---------------------------------------------------------------------------
 
-inline void delete_data(void* data, data_type_t type)
+void delete_data(void* data, data_type_t type)
 {
     if (type == NNR_DATA_TYPE_STRING) {
         delete[] (std::string*)data;
@@ -163,7 +173,11 @@ inline void delete_data(void* data, data_type_t type)
 tensor_t::tensor_t(std::string_view name, data_type_t type, std::span<const int> dims)
     : name(name)
 {
-    reinit(type, dims);
+    // reinit's return is captured in the `allocation_failed` member — ctors
+    // can't propagate a bool, and callers that `new` a tensor_t check that
+    // field after construction. Ignore [[nodiscard]] warning here since the
+    // member already captures the same signal.
+    (void)reinit(type, dims);
 }
 
 tensor_t::~tensor_t()
@@ -173,7 +187,18 @@ tensor_t::~tensor_t()
     }
 }
 
-void tensor_t::reinit(data_type_t type, std::span<const int> dims)
+void tensor_t::clear_quant()
+{
+    quant_scale = 0.0f;
+    quant_zero_point = 0;
+    quant_axis = -1;
+    nnr_aligned_free(quant_scales);
+    quant_scales = nullptr;
+    nnr_aligned_free(quant_zero_points);
+    quant_zero_points = nullptr;
+}
+
+bool tensor_t::reinit(data_type_t type, std::span<const int> dims)
 {
     const int ndim = static_cast<int>(dims.size());
     size_t n;
@@ -181,15 +206,46 @@ void tensor_t::reinit(data_type_t type, std::span<const int> dims)
     if (ndim > 0) {
         this->ndim = 0;
     }
-    if (owns_data && (ndata > 0) && data) {
-        delete_data(data, this->type);
+    // Preserve view state: when the memory planner has marked this tensor as
+    // a non-owning view (owns_data=false), reinit must update dims/strides
+    // without allocating fresh storage and without flipping ownership. The
+    // view executor (e.g. Slice) will assign data=view_pointer after reshape.
+    // Without this, ssd-12's NMS→Slice path reseats the view as an owning
+    // tensor whose `data` points into another buffer, producing a heap-free
+    // crash at teardown.
+    //
+    // Two non-owning sub-cases share owns_data=false:
+    //   - pool-backed: data points at a pool slot sized for the planned max
+    //     shape; a smaller reshape (e.g. NMS shrinking to actual results)
+    //     must keep that pointer or the op's exec writes to nullptr.
+    //   - view-aliased: data was zeroed by the planner's third pass, exec
+    //     will reassign from input.
+    // Preserving the existing `data` value handles both: pool slot stays
+    // valid, view-aliased stays null until exec assigns.
+    const bool was_owning = owns_data;
+    if (was_owning) {
+        if ((ndata > 0) && data) {
+            delete_data(data, this->type);
+        }
+        data = nullptr;
     }
-    data = nullptr;
+    // Non-owning: leave `data` untouched. Pool slots stay valid for the
+    // planned max size; view-aliased tensors were already nulled by the
+    // planner and stay null.
+#ifdef NNR_ENABLE_WEBGPU
+    // reinit frees t->data and re-allocates at a new address/size. Any GPU
+    // residency record we built previously is now semantically stale; drop
+    // it so the next ensure_buffer rebuilds cleanly. Without this, callers
+    // had to remember to manually webgpu::mark_cpu_written(t) after reinit,
+    // which is an easy-to-miss footgun when models use dynamic shapes.
+    webgpu::forget(this);
+#endif
     ndata = 0;
-    owns_data = true;
+    owns_data = was_owning;
+    allocation_failed = false;
     this->type = type;
     if (type == NNR_DATA_TYPE_UNDEFINED) {
-        return;
+        return true;
     }
     if ((ndim > 0) && !dims.empty()) {
         assert(ndim <= MAX_NDIM);
@@ -211,15 +267,27 @@ void tensor_t::reinit(data_type_t type, std::span<const int> dims)
         if (overflow) {
             data = nullptr;
             ndata = 0;
-            return;
+            allocation_failed = true;
+            return false;
         }
     }else {
         n = 1;
     }
     if (n == 0) {
-        data = nullptr;
+        // Valid zero-sized tensor — not a failure, just no storage.
+        // For non-owning tensors keep `data` so a subsequent reshape back
+        // to non-zero dims can reuse the pool slot.
+        if (was_owning) data = nullptr;
         ndata = 0;
-        return;
+        return true;
+    }
+    if (!was_owning) {
+        // Non-owning tensor: dims/strides updated, consumer-visible ndata
+        // reflects logical extent. `data` was preserved above — pool slots
+        // remain valid for the planned max size; view-aliased tensors stay
+        // null until their producing op's exec assigns from input.
+        ndata = n;
+        return true;
     }
     switch (type) {
     case NNR_DATA_TYPE_UNDEFINED: break;
@@ -252,10 +320,22 @@ void tensor_t::reinit(data_type_t type, std::span<const int> dims)
     case NNR_DATA_TYPE_SEQUENCE:
         data = new (std::nothrow) sequence_t();
         ndata = 1;
-        return;
+        if (!data) {
+            ndata = 0;
+            allocation_failed = true;
+            return false;
+        }
+        return true;
     default: break;
     }
     ndata = n;
+    if (!data) {
+        // operator new returned nullptr — ndata reflects the requested size
+        // so callers can still reason about "wanted X, got nothing".
+        allocation_failed = true;
+        return false;
+    }
+    return true;
 }
 
 void tensor_t::apply(const void* buf, size_t len)
@@ -285,7 +365,7 @@ void tensor_t::apply(const void* buf, size_t len)
     }
 }
 
-void tensor_t::apply(const tensor_t& t)
+bool tensor_t::apply(const tensor_t& t)
 {
     if (ndim != t.ndim || type != t.type || memcmp(dims, t.dims, sizeof(int) * t.ndim) != 0) {
         bool need_reinit = (type == NNR_DATA_TYPE_UNDEFINED || t.type == NNR_DATA_TYPE_UNDEFINED
@@ -295,7 +375,7 @@ void tensor_t::apply(const tensor_t& t)
             && type != NNR_DATA_TYPE_STRING && t.type != NNR_DATA_TYPE_STRING) {
             // compatible sizes, keep original type
         } else {
-            reinit(t.type, t.dim_span());
+            if (!reinit(t.type, t.dim_span())) return false;
         }
     }
     if (data && t.data && ndata > 0) {
@@ -314,13 +394,14 @@ void tensor_t::apply(const tensor_t& t)
         }
         }
     }
+    return true;
 }
 
 bool tensor_t::reshape(std::span<const int> dims, data_type_t type)
 {
     const int ndim = static_cast<int>(dims.size());
     if ((this->ndim != ndim) || (!dims.empty() && (memcmp(&this->dims[0], dims.data(), sizeof(int) * ndim) != 0)) || (this->type != type)) {
-        reinit(type, dims);
+        if (!reinit(type, dims)) return false;
     }
     return true;
 }
@@ -329,7 +410,7 @@ bool tensor_t::reshape_identity(const tensor_t* x, data_type_t type)
 {
     if (x->ndim > 0 || x->ndata > 0) {
         if ((this->ndim != x->ndim) || (memcmp(this->dims, x->dims, sizeof(int) * this->ndim) != 0) || (this->type != type)) {
-            reinit(type, x->dim_span());
+            if (!reinit(type, x->dim_span())) return false;
         }
     }
     // Propagate quantization metadata from input to output
@@ -362,12 +443,12 @@ bool tensor_t::reshape_multi_broadcast(const tensor_t* a, const tensor_t* b, dat
         }
     }
     if ((this->type != type) || (this->ndim != ndim) || (memcmp(this->dims, dims.data(), sizeof(int) * ndim) != 0)) {
-        reinit(type, dims);
+        if (!reinit(type, dims)) return false;
     }
     return true;
 }
 
-void* tensor_t::broadcast_map_address(const tensor_t* y, int offset)
+void* tensor_t::broadcast_map_address(const tensor_t* y, int64_t offset)
 {
     int xndim = this->ndim;
     int yndim = y->ndim;
@@ -407,9 +488,10 @@ void copy_data(tensor_t* y, const tensor_t* x)
         dst->elem_type = src->elem_type;
         for (const auto* t : src->tensors) {
             tensor_t* copy = new (std::nothrow) tensor_t("", t->type, t->dim_span());
-            if (copy) {
-                copy->apply(*t);
+            if (copy && !copy->allocation_failed && copy->apply(*t)) {
                 dst->tensors.push_back(copy);
+            } else {
+                delete copy;
             }
         }
     } else {
@@ -650,12 +732,24 @@ context_t::~context_t()
         planner.release();
         memory_planned = false;
     }
+#ifdef NNR_ENABLE_WEBGPU
+    // Release the WebGPU residency records keyed on these tensor pointers
+    // BEFORE delete, or the next context's tensor allocations may reuse an
+    // address and inherit a stale record (e.g. gpu_valid=true pointing at a
+    // prior run's buffer), silently skipping the upload of fresh CPU data.
+    for (auto& [key, value] : map)    webgpu::forget(value);
+    for (auto* t : attr_tensors_)     webgpu::forget(t);
+#endif
     for (auto& [key, value] : map) {
         delete value;
     }
     for (auto* t : attr_tensors_)    delete t;
     for (auto* g : attr_subgraphs_)  delete g;
-    _aligned_free(workspace);
+    nnr_aligned_free(workspace);
+    // Free multi-backend state (GPU caches, etc.)
+    for (auto& b : backends) {
+        if (b.free_fn && b.data) b.free_fn(b.data);
+    }
     if (model_free_ && model_data_) model_free_(model_data_);
     // Free mmap AFTER model_data_ — model's string_views may alias into mmap'd region
     if (mmap_free_ && mmap_data_) mmap_free_(mmap_data_);
@@ -664,11 +758,31 @@ context_t::~context_t()
 void context_t::pool_sleep() { nnr::pool_sleep(); }
 void context_t::pool_wake()  { nnr::pool_wake(); }
 
-void context_t::set_num_threads(int n) {
+void set_global_thread_count(int n) {
 #ifndef NNR_NO_THREAD_POOL
     thread_pool_t::configure(std::max(1, n));
+#else
+    (void)n;
 #endif
 }
+
+// Deprecated: forwards to set_global_thread_count. Declared [[deprecated]]
+// in the header; suppress the warning on the definition itself.
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable : 4996)
+#endif
+void context_t::set_num_threads(int n) {
+    set_global_thread_count(n);
+}
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
 
 void context_t::invalidate_shapes()
 {
@@ -783,9 +897,83 @@ bool context_t::load(const void* buf, size_t len)
 static void ensure_workspace(context_t* ctx, size_t ws)
 {
     if (ws > ctx->workspace_size) {
-        _aligned_free(ctx->workspace);
-        ctx->workspace = _aligned_malloc(ws, 64);
+        nnr_aligned_free(ctx->workspace);
+        ctx->workspace = nnr_aligned_alloc(ws, 64);
         ctx->workspace_size = ws;
+    }
+}
+
+#if defined(NNR_USE_CUDA)
+// CUDA Graph capture/replay hooks — defined in backend/gpu/cuda/cuda_backend.cpp.
+// Opaque ints used to avoid leaking CUDA headers into nnr.cpp.
+int  cuda_begin_run(context_t* ctx, bool all_ops_gpu, bool shapes_dirty);
+void cuda_end_run  (context_t* ctx, int mode);
+bool cuda_replay_and_sync(context_t* ctx);
+#endif
+
+#if defined(NNR_USE_CUPTI)
+// Drain CUPTI kernel records and accumulate per-op GPU time into profile[].
+// Called after each inference run (after cudaStreamSynchronize). Records that
+// can't be assigned to an op (no canonical sequence yet) are dropped.
+//
+// host_clock_fired tells us whether the host-side prof.end() incremented
+// calls for the just-completed run. In normal/capture mode it did, so CUPTI
+// should not bump calls or it would double-count. In replay mode the fast
+// path is skipped, so CUPTI must bump calls = 1 per op exec'd this run.
+static void drain_cupti_into_profile(std::vector<node_profile_t>& profile,
+                                     bool host_clock_fired) {
+    auto& cp = nnr::gpu::cupti_profiler();
+    cp.flush();
+    auto recs = cp.drain();
+#ifdef _WIN32
+    int64_t qpc_freq;
+    QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(&qpc_freq));
+    // Convert ns → QPC ticks so the values share node_profile_t::total_ticks
+    // semantics with the host-clock profiler. ticks = ns * qpc_freq / 1e9.
+    const double ns_to_ticks = (double)qpc_freq / 1e9;
+#else
+    const double ns_to_ticks = 1.0;  // already ns
+#endif
+    // Each op may launch multiple kernels — their times sum into the same
+    // op_idx so per-op total reflects total GPU work for that op invocation.
+    // calls is incremented once per (op_idx, drain) when host-clock didn't
+    // already do it for this run.
+    std::unordered_set<uint32_t> bumped;
+    for (auto& r : recs) {
+        if (r.op_idx == UINT32_MAX) continue;
+        if (r.op_idx >= profile.size()) continue;
+        int64_t dur_ns = (int64_t)(r.end_ns - r.start_ns);
+        profile[r.op_idx].total_ticks += (int64_t)(dur_ns * ns_to_ticks);
+        if (!host_clock_fired && bumped.insert(r.op_idx).second) {
+            profile[r.op_idx].calls++;
+        }
+    }
+}
+#endif
+
+// If this op runs on CPU but reads tensors that were last written by a
+// GPU backend (device buffer present + last_write_evt set), download them.
+// Cheap when no GPU backend is active (inner loop is empty). Idempotent.
+static inline void sync_inputs_to_host(context_t* ctx, operator_t* op) {
+    if (op->device_tag != 0) return;          // GPU op — input stays on device
+    for (auto& b : ctx->backends) {
+        if (!b.data || !b.writeback_fn) continue;
+        for (auto* in : op->inputs)
+            if (in) b.writeback_fn(b.data, in);
+    }
+}
+
+// After run_graph completes, make sure all graph outputs are on the host.
+static inline void sync_graph_outputs_to_host(context_t* ctx) {
+    bool any_backend = false;
+    for (auto& b : ctx->backends)
+        if (b.data && b.writeback_fn) { any_backend = true; break; }
+    if (!any_backend) return;
+    for (auto& name : ctx->graph_outputs) {
+        tensor_t* t = ctx->search_tensor(name);
+        if (!t) continue;
+        for (auto& b : ctx->backends)
+            if (b.data && b.writeback_fn) b.writeback_fn(b.data, t);
     }
 }
 
@@ -891,6 +1079,13 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
     auto& nodes = ctx->graph->nodes;
     const int num_nodes = static_cast<int>(nodes.size());
     const bool have_plan = ctx->optimizer->plan_built;
+
+#ifdef NNR_ENABLE_WEBGPU
+    // Allocate / resize the per-op timestamp QuerySet to cover this graph's
+    // node count. No-op unless NNR_WEBGPU_OP_TIMINGS is set and the device
+    // exposes TimestampQuery. See backend/webgpu/profiler.cpp.
+    nnr::webgpu::op_profiler_begin_run(num_nodes);
+#endif
 #ifdef NNR_PROFILE_REORDERS
     g_reorder_stats.inferences++;
 #endif
@@ -901,6 +1096,39 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
     // Conv to misinterpret NCHW data as BLOCKED_16.
     if (have_plan)
         ctx->optimizer->reset_formats();
+
+    // CUDA Graph: opportunistic capture + replay. When the plan is stable and
+    // every actionable op is on CUDA, replay a previously-captured cudaGraphExec
+    // instead of the op-by-op exec loop — or start capturing on this run.
+    // no-op when NNR_USE_CUDA=OFF or no CUDA backend is active.
+#if defined(NNR_USE_CUDA)
+    int cuda_mode = 0;  // 0=normal, 1=replaying, 2=capturing
+    if (have_plan && !ctx->optimizer->exec_steps.empty() && !ctx->shapes_dirty) {
+        bool all_gpu = true;
+        for (auto& step : ctx->optimizer->exec_steps) {
+            auto* n = step.op;
+            if (step.scroll_seg == -2) continue;
+            if (n->folded) continue;
+            if (n->device_tag == 0) { all_gpu = false; break; }
+        }
+        cuda_mode = cuda_begin_run(ctx, all_gpu, ctx->shapes_dirty);
+#if defined(NNR_USE_CUPTI)
+        nnr::gpu::cupti_profiler().init();
+#endif
+        if (cuda_mode == 1) {
+            cuda_replay_and_sync(ctx);
+            cuda_end_run(ctx, cuda_mode);
+#if defined(NNR_USE_CUPTI)
+            // Replay mode: fast-path skipped, so host-clock prof.end never
+            // fired for this run. CUPTI canonical-sequence matching (built
+            // up during the slow-path warmup) recovers op_idx, and we bump
+            // calls inside the drain to keep accounting consistent.
+            drain_cupti_into_profile(ctx->profile, /*host_clock_fired=*/false);
+#endif
+            goto graph_output_reorder;
+        }
+    }
+#endif
 
     // Fast path: pre-compiled execution steps (after plan is built).
     // Iterates only actionable steps — no FOLDED/SCROLL_INSIDE scanning.
@@ -1030,10 +1258,34 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
                 }
             }
 
+            sync_inputs_to_host(ctx, n);
+#if defined(NNR_USE_CUPTI)
+            nnr::gpu::cupti_profiler().push_op((uint32_t)step.node_idx);
+#endif
             prof.begin();
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::op_profiler_op_begin(step.node_idx);
+#endif
             { NNR_TRACE_SCOPE("op", n->op_type);
-            if (!n->exec()) return false;
-            } prof.end(step.node_idx);
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::sync_inputs_if_cpu_op(n);
+#endif
+            if (!n->exec()) {
+                fprintf(stderr, "[run_graph] exec() failed at node %d (%.*s)\n",
+                        step.node_idx, (int)n->op_type.size(), n->op_type.data());
+                return false;
+            }
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::sync_outputs_if_cpu_op(n);
+#endif
+            }
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::op_profiler_op_end(step.node_idx);
+#endif
+            prof.end(step.node_idx);
+#if defined(NNR_USE_CUPTI)
+            nnr::gpu::cupti_profiler().pop_op();
+#endif
 
             // Propagate NHWC/BLOCKED_16 through layout-agnostic ops
             if (has_nhwc_input && !wants_nhwc && is_layout_all) {
@@ -1187,10 +1439,28 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
         case node_action_t::SCROLL_INSIDE:
             break;
         case node_action_t::EXEC:
+            sync_inputs_to_host(ctx, n);
             prof.begin();
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::op_profiler_op_begin(i);
+#endif
             { NNR_TRACE_SCOPE("op", n->op_type);
-            if (!n->exec()) return false;
-            } prof.end(i);
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::sync_inputs_if_cpu_op(n);
+#endif
+            if (!n->exec()) {
+                fprintf(stderr, "[run_graph] exec() failed at node %d (%.*s)\n",
+                        i, (int)n->op_type.size(), n->op_type.data());
+                return false;
+            }
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::sync_outputs_if_cpu_op(n);
+#endif
+            }
+#ifdef NNR_ENABLE_WEBGPU
+            nnr::webgpu::op_profiler_op_end(i);
+#endif
+            prof.end(i);
             if (has_nhwc_input && !wants_nhwc && n->layout_mask == LAYOUT_ALL) {
                 for (auto* t : n->outputs)
                     if (t && t->ndim == 4)
@@ -1208,27 +1478,70 @@ static bool run_graph_impl(context_t* ctx, Profiler prof)
 
 graph_output_reorder:
 
+#if defined(NNR_USE_CUDA)
+    // If we were capturing this run, finalize the graph now, then replay it once
+    // to actually produce outputs (capture only records — kernel launches under
+    // capture are not executed).
+    if (cuda_mode == 2) {
+        cuda_end_run(ctx, cuda_mode);
+        cuda_replay_and_sync(ctx);
+    } else if (cuda_mode != 1) {
+        // normal mode — still increment run_count for capture eligibility
+        cuda_end_run(ctx, cuda_mode);
+    }
+#if defined(NNR_USE_CUPTI)
+    // Drain CUPTI records for the just-completed run (normal or capture).
+    // Fast/slow path ran exec() with prof.begin/end and CUPTI push/pop, so
+    // host-clock already bumped calls — the drain only adds GPU time.
+    if (cuda_mode != 1) {
+        drain_cupti_into_profile(ctx->profile, /*host_clock_fired=*/true);
+    }
+#endif
+#endif
+
+    // Bring GPU-written outputs back to host memory before the caller sees them.
+    // No-op when no GPU backend is active.
+    sync_graph_outputs_to_host(ctx);
+
+    // Resolve output tensors once, lazily. `search_tensor` does a linear
+    // scan over `ctx->map`; caching the pointer eliminates O(|outputs| ×
+    // |map|) work on every inference.
+    if (ctx->graph_output_tensors.size() != ctx->graph_outputs.size()) {
+        ctx->graph_output_tensors.clear();
+        ctx->graph_output_tensors.reserve(ctx->graph_outputs.size());
+        for (auto& name : ctx->graph_outputs)
+            ctx->graph_output_tensors.push_back(ctx->search_tensor(name));
+    }
+
     // Reorder NHWC graph outputs to NCHW so caller always sees NCHW.
     // Internal ops may leave outputs in NHWC for efficiency, but the
-    // public API contract is NCHW output.
-    for (auto& name : ctx->graph_outputs) {
-        tensor_t* t = ctx->search_tensor(name);
-        if (t && t->format == memory_layout_t::NHWC
-            && t->ndim == 4 && t->type == NNR_DATA_TYPE_FLOAT32) {
-            size_t sz = t->ndata * sizeof(float);
+    // public API contract is NCHW output.  Non-float types (uint8/int8
+    // for QDQ graphs, fp16 for attention) go through the byte-generic
+    // path since the SIMD nhwc_to_nchw is float-only.
+    for (tensor_t* t : ctx->graph_output_tensors) {
+        if (t && t->format == memory_layout_t::NHWC && t->ndim == 4) {
+            size_t elem_sz = data_type_sizeof(t->type);
+            size_t sz = t->ndata * elem_sz;
             if (sz > ctx->workspace_size)
                 ensure_workspace(ctx, sz);
 #ifdef DEBUG_LAYOUT
             auto rt0 = std::chrono::high_resolution_clock::now();
 #endif
-            reorder_inplace((float*)t->data, t->dims[0], t->dims[1],
-                t->dims[2], t->dims[3],
-                memory_layout_t::NHWC, memory_layout_t::NCHW,
-                (float*)ctx->workspace);
+            if (t->type == NNR_DATA_TYPE_FLOAT32) {
+                reorder_inplace((float*)t->data, t->dims[0], t->dims[1],
+                    t->dims[2], t->dims[3],
+                    memory_layout_t::NHWC, memory_layout_t::NCHW,
+                    (float*)ctx->workspace);
+            } else {
+                reorder_inplace_bytes(t->data, t->dims[0], t->dims[1],
+                    t->dims[2], t->dims[3],
+                    memory_layout_t::NHWC, memory_layout_t::NCHW,
+                    ctx->workspace, elem_sz);
+            }
 #ifdef DEBUG_LAYOUT
             auto rt1 = std::chrono::high_resolution_clock::now();
-            fprintf(stderr, "[reorder] graph output NHWC->NCHW [%d,%d,%d,%d] %.0f us\n",
-                t->dims[0], t->dims[1], t->dims[2], t->dims[3],
+            fprintf(stderr, "[reorder] graph output NHWC->NCHW [%d,%d,%d,%d] type=%d %.0f us\n",
+                t->dims[0], t->dims[1], t->dims[2], t->dims[3], (int)t->type,
                 std::chrono::duration<double, std::micro>(rt1 - rt0).count());
 #endif
             t->format = memory_layout_t::NCHW;
@@ -1236,8 +1549,7 @@ graph_output_reorder:
     }
 
     // Reorder BLOCKED_16 graph outputs to NCHW.
-    for (auto& name : ctx->graph_outputs) {
-        tensor_t* t = ctx->search_tensor(name);
+    for (tensor_t* t : ctx->graph_output_tensors) {
         if (t && t->format == NATIVE_BLOCKED_FMT && NATIVE_BLOCKED_FMT != memory_layout_t::NCHW
             && t->ndim == 4 && t->type == NNR_DATA_TYPE_FLOAT32) {
             int N = t->dims[0], C = t->dims[1], H = t->dims[2], W = t->dims[3];
@@ -1255,6 +1567,14 @@ graph_output_reorder:
 
 static bool run_graph(context_t* ctx)
 {
+    // The optimizer can splice nodes into ctx->graph->nodes after
+    // enable_profiling() sized the profile vector (e.g. insert_reorders
+    // synthesizes Reorder ops at layout boundaries). Resize defensively
+    // so profile[i] stays in bounds for every active node.
+    if (!ctx->profile.empty() && ctx->graph
+            && ctx->profile.size() < ctx->graph->nodes.size()) {
+        ctx->profile.resize(ctx->graph->nodes.size());
+    }
     if (ctx->profile.empty())
         return run_graph_impl(ctx, profiler_noop{});
     else
@@ -1304,34 +1624,117 @@ static bool fold_run(context_t* ctx)
         if (ctx->initializer_names.count(name))
             constants.insert(tensor);
 
+    // Helper: build a transient CPU operator that mirrors `n`'s identity.
+    // Used as a per-iteration shadow for non-CPU ops so reshape() and
+    // exec() during fold_run write to host-side tensor->data, which
+    // downstream reshape() (TopK's K, Reshape's shape, Slice's bounds…)
+    // and constant folding read on the CPU side. Returns nullptr if no
+    // CPU resolver exists or init() fails. Pool-allocated; not freed
+    // here (lifetime tied to ctx->attr_pool).
+    auto build_cpu_shadow = [&](operator_t* n) -> operator_t* {
+        operator_t* s = solve_operator(n->op_type, n->opset,
+                                       ctx->attr_pool, backend_t::CPU);
+        if (!s) return nullptr;
+        s->ctx       = ctx;
+        s->opset     = n->opset;
+        s->op_type   = n->op_type;
+        s->node_name = n->node_name;
+        s->domain    = n->domain;
+        s->inputs    = n->inputs;
+        s->outputs   = n->outputs;
+        s->attrs     = n->attrs;
+        if (!s->init()) return nullptr;
+        return s;
+    };
+
     for (auto* n : nodes) {
         // Skip fused/folded/inactive nodes — their inputs may be invalid
         if (n->skip || n->folded) continue;
-        if (!n->reshape()) {
-            std::fprintf(stderr, "nnr: reshape failed: %.*s (%.*s)\n",
-                         (int)n->op_type.size(), n->op_type.data(),
-                         (int)n->node_name.size(), n->node_name.data());
-            for (size_t ii = 0; ii < n->inputs.size(); ii++) {
-                auto* t = n->inputs[ii];
-                if (!t) { std::fprintf(stderr, "  input[%zu]: null\n", ii); continue; }
-                std::fprintf(stderr, "  input[%zu]: [", ii);
-                for (int d = 0; d < t->ndim; d++) std::fprintf(stderr, "%s%d", d?",":"", t->dims[d]);
-                auto tn = data_type_tostring(t->type);
-                std::fprintf(stderr, "] %.*s%s\n",
-                    (int)tn.size(), tn.data(),
-                    t->data ? "" : " (no data)");
-            }
-            for (size_t ii = 0; ii < n->outputs.size(); ii++) {
-                auto* t = n->outputs[ii];
-                if (!t) continue;
-                std::fprintf(stderr, "  output[%zu]: [", ii);
-                for (int d = 0; d < t->ndim; d++) std::fprintf(stderr, "%s%d", d?",":"", t->dims[d]);
-                auto tn = data_type_tostring(t->type);
-                std::fprintf(stderr, "] %.*s\n", (int)tn.size(), tn.data());
-            }
-            return false;
+
+        // Mirror CUDA's "no GPU during fold_run" gate
+        // (cuda_backend.cpp:14-21): GPU exec writes only to device memory,
+        // but fold_run's downstream consumers — reshape() data reads and
+        // constant folding — read tensor->data on the host. CUDA achieves
+        // this via a per-op CPU `fallback` field; for backends without one
+        // (today: WebGPU), we shadow non-CPU ops with a transient CPU
+        // operator for the fold_run pass. The original GPU op stays in
+        // nodes[] for runtime use.
+        operator_t* eff = n;
+        if (n->resolved_backend != static_cast<uint8_t>(backend_t::CPU)) {
+            if (operator_t* shadow = build_cpu_shadow(n))
+                eff = shadow;
         }
-        size_t ws = n->workspace_size();
+
+        if (!eff->reshape()) {
+            // If the original was non-CPU and the shadow path didn't apply
+            // (no CPU resolver, or init failed), try the legacy reshape-
+            // failure CPU fallback once and swap permanently. Some reshape
+            // failures are backend-specific (WebGPU Gather rejecting int64
+            // data, for instance, where the type is only known at reshape
+            // time because the producer is a Shape op). Replacing the op
+            // with a CPU equivalent keeps prepare() going instead of
+            // killing the whole graph.
+            bool fell_back = false;
+            if (eff == n && n->resolved_backend != static_cast<uint8_t>(backend_t::CPU)) {
+                if (operator_t* cpu_n = build_cpu_shadow(n)) {
+                    if (cpu_n->reshape()) {
+                        // Swap in place; preserves iteration order.
+                        for (size_t ni = 0; ni < nodes.size(); ++ni) {
+                            if (nodes[ni] == n) { nodes[ni] = cpu_n; n = cpu_n; eff = cpu_n; break; }
+                        }
+                        fell_back = true;
+                    }
+                }
+            }
+            if (!fell_back) {
+                std::fprintf(stderr, "nnr: reshape failed: %.*s (%.*s)\n",
+                             (int)n->op_type.size(), n->op_type.data(),
+                             (int)n->node_name.size(), n->node_name.data());
+                for (size_t ii = 0; ii < n->inputs.size(); ii++) {
+                    auto* t = n->inputs[ii];
+                    if (!t) { std::fprintf(stderr, "  input[%zu]: null\n", ii); continue; }
+                    std::fprintf(stderr, "  input[%zu]: [", ii);
+                    for (int d = 0; d < t->ndim; d++) std::fprintf(stderr, "%s%d", d?",":"", t->dims[d]);
+                    auto tn = data_type_tostring(t->type);
+                    std::fprintf(stderr, "] %.*s%s\n",
+                        (int)tn.size(), tn.data(),
+                        t->data ? "" : " (no data)");
+                }
+                for (size_t ii = 0; ii < n->outputs.size(); ii++) {
+                    auto* t = n->outputs[ii];
+                    if (!t) continue;
+                    std::fprintf(stderr, "  output[%zu]: [", ii);
+                    for (int d = 0; d < t->ndim; d++) std::fprintf(stderr, "%s%d", d?",":"", t->dims[d]);
+                    auto tn = data_type_tostring(t->type);
+                    std::fprintf(stderr, "] %.*s\n", (int)tn.size(), tn.data());
+                }
+                return false;
+            }
+        }
+        // If we ran a CPU shadow above, the original GPU op never had its
+        // own reshape() called — backend-specific state (WebGPU pipelines,
+        // uniform buffers, output buffer allocations) wouldn't be set up
+        // for runtime exec(). The shadow's reshape has populated output
+        // dims/types so the GPU op's reshape can complete; do it now,
+        // before any control-flow `continue` skips past it.
+        if (eff != n) {
+            if (!n->reshape()) {
+                // Backend reshape rejected something the shadow accepted
+                // (e.g. dtype/layout the GPU kernel doesn't support).
+                // Demote permanently to the shadow so runtime is correct.
+                for (size_t ni = 0; ni < nodes.size(); ++ni) {
+                    if (nodes[ni] == n) { nodes[ni] = eff; n = eff; break; }
+                }
+            }
+        }
+
+        // Workspace must satisfy both shadow (CPU exec, this pass) and
+        // original (GPU exec, runtime). ensure_workspace is grow-only.
+        size_t ws = eff->workspace_size();
+        if (eff != n) {
+            size_t ws_n = n->workspace_size();
+            if (ws_n > ws) ws = ws_n;
+        }
         if (ws > ctx->workspace_size)
             ensure_workspace(ctx, ws);
 
@@ -1352,7 +1755,7 @@ static bool fold_run(context_t* ctx)
 
         if (all_const && !has_null_data) {
             // Fully constant: exec, fold, exclude from memory planning.
-            if (!n->exec()) {
+            if (!eff->exec()) {
                 std::fprintf(stderr, "nnr: constant fold failed: %.*s (%.*s)\n",
                              (int)n->op_type.size(), n->op_type.data(),
                              (int)n->node_name.size(), n->node_name.data());
@@ -1369,7 +1772,7 @@ static bool fold_run(context_t* ctx)
             // (e.g. Shape→Gather→ReduceMin chains that feed into Reshape/TopK).
             // Output may be garbage for activation paths but correct for
             // shape paths.  Failures are ignored — garbage floats are fine.
-            n->exec();
+            eff->exec();
         }
     }
     return true;
@@ -1378,6 +1781,12 @@ static bool fold_run(context_t* ctx)
 bool context_t::prepare()
 {
     if (!graph) return false;
+
+    // PREPROCESS-level passes (graph rewrites like LayerNorm + Gelu fusion)
+    // must run before fold_run so constant folding sees the fused graph.
+    // Without this, bench.exe misses graph rewrites that run() would apply
+    // via its first-run preprocess call.
+    optimizer->preprocess(this);
 
     // Reshape all nodes and exec only constant-foldable nodes.
     // Non-constant ops are skipped here; prune_segments() will warm them up
@@ -1421,6 +1830,11 @@ bool context_t::run_for_warmup()
             if (t && !t->data && t->type != NNR_DATA_TYPE_UNDEFINED) { safe = false; break; }
         if (safe) n->exec();
     }
+#ifdef NNR_ENABLE_WEBGPU
+    // Flush any WebGPU dispatches queued during warmup so subsequent
+    // scroll-timing trials see populated tensor data, not pending work.
+    nnr::webgpu::flush_encoder();
+#endif
     return true;
 }
 
@@ -1456,7 +1870,11 @@ bool context_t::run()
         }
     }
 
-    if (memory_planned)
+    // Zero the activation pool only the first time after (re)allocation.
+    // Operators write every cell of their output before reading it, so
+    // stale bytes from a previous run are overwritten; blanket-memset on
+    // every run was the memory-bandwidth cost flagged by F-PHP-001.
+    if (memory_planned && !planner.is_pool_zeroed())
         planner.zero_pool();
 
     if (!run_graph(this))
@@ -1478,6 +1896,22 @@ bool context_t::run()
         planner.apply();
         memory_planned = true;
     }
+
+#ifdef NNR_ENABLE_WEBGPU
+    // Submit any WebGPU dispatches still pending in the shared encoder.
+    // Without this, ops that don't trigger a CPU download (e.g. when no
+    // CPU op consumes their output and the user doesn't read the graph
+    // output mid-loop) would silently not run until the next download —
+    // breaking timing measurements and benchmark semantics. No-op when
+    // no encoder is active (CPU-only graphs, or already flushed by a
+    // boundary download).
+    //
+    // When per-op profiling is active, append ResolveQuerySet + readback
+    // copy commands before the flush submits, then map+read after.
+    nnr::webgpu::op_profiler_pre_flush();
+    nnr::webgpu::flush_encoder();
+    nnr::webgpu::op_profiler_post_flush();
+#endif
 
     return true;
 }

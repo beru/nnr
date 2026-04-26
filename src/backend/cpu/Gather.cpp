@@ -49,38 +49,57 @@ struct Gather_operator : public operator_t {
 
     template <typename T>
     bool exec() {
+        tensor_t* y = outputs[0];
         const tensor_t* data = inputs[0];
         const tensor_t* indices = inputs[1];
-        tensor_t* y = outputs[0];
-        if (!data || !data->data || !indices || !indices->data || !y || !y->data)
-            return false;
-        const T* pdata = (const T*)data->data;
-        T* py = (T*)y->data;
+
+        // Re-derive y from data's live dims — an upstream
+        // NonMaxSuppression can shrink data->dims during exec(), and the
+        // fast path skips reshape(). Without this y->ndata stays at the
+        // prepare-time upper bound while data has shrunk, so the gather
+        // walks past the live region (ssd-12-int8 NMS→Gather crash).
+        // reshape() also re-types y if needed.
+        if (!reshape()) return false;
+        // Empty output: nothing to gather (e.g. data shrunk to 0 along a
+        // pre-axis dim by NMS). Don't dereference data->data.
+        if (y->ndata == 0) return true;
+
+        if (!data || !indices || !y) return false;
 
         const int data_ndim = data->ndim;
         const int indices_ndim = indices->ndim;
         if (caxis >= data_ndim) return false;
         const int axis_dim = data->dims[caxis];
-        if (axis_dim <= 0) return false;
+        // axis_dim==0 means upstream produced no rows to gather (e.g. NMS
+        // returned no detections). y's other-axis dims may still be
+        // non-zero, but there is no valid index into a 0-element axis;
+        // leave the (uninitialized / pool-zeroed) output as-is and
+        // propagate empty downstream.
+        if (axis_dim <= 0) return true;
+        if (!data->data || !indices->data || !y->data) return false;
+        const T* pdata = (const T*)data->data;
+        T* py = (T*)y->data;
 
-        // Compute the number of elements in the prefix (before axis), indices, and suffix (after axis)
-        int outer = 1;
+        // Compute the number of elements in the prefix (before axis), indices, and suffix (after axis).
+        // Widened to int64_t because outer * axis_dim * inner overflows int32 on large embedding
+        // tables (vocab_size * hidden_dim easily exceeds 2^31 on real LLMs).
+        int64_t outer = 1;
         for (int i = 0; i < caxis; ++i) {
             outer *= data->dims[i];
         }
-        int inner = 1;
+        int64_t inner = 1;
         for (int i = caxis + 1; i < data_ndim; ++i) {
             inner *= data->dims[i];
         }
-        int indices_size = (int)indices->ndata;
+        int64_t indices_size = (int64_t)indices->ndata;
 
         // data layout: [outer, axis_dim, inner]
         // output layout: [outer, indices_size, inner]
-        for (int o = 0; o < outer; ++o) {
-            for (int idx = 0; idx < indices_size; ++idx) {
-                int index;
+        for (int64_t o = 0; o < outer; ++o) {
+            for (int64_t idx = 0; idx < indices_size; ++idx) {
+                int64_t index;
                 if (indices->type == NNR_DATA_TYPE_INT64) {
-                    index = (int)((const int64_t*)indices->data)[idx];
+                    index = ((const int64_t*)indices->data)[idx];
                 } else {
                     index = ((const int32_t*)indices->data)[idx];
                 }
@@ -92,7 +111,7 @@ struct Gather_operator : public operator_t {
                 }
                 const T* src = pdata + (o * axis_dim + index) * inner;
                 T* dst = py + (o * indices_size + idx) * inner;
-                for (int s = 0; s < inner; ++s) {
+                for (int64_t s = 0; s < inner; ++s) {
                     dst[s] = src[s];
                 }
             }

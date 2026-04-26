@@ -48,8 +48,7 @@ struct Optional_operator : public operator_t {
             }
             return true;
         }
-        y->apply(*x);
-        return true;
+        return y->apply(*x);
     }
 };
 

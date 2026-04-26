@@ -32,6 +32,12 @@ pool_t::~pool_t()
 void pool_t::alloc_block()
 {
     void* p = NNR_VMALLOC(BlockSize);
+#ifndef _WIN32
+    // mmap returns MAP_FAILED (((void*)-1) on all known kernels) on failure,
+    // not nullptr. Without this branch, an OOM pool would silently
+    // dereference an invalid pointer on the next alloc.
+    if (p == MAP_FAILED) p = nullptr;
+#endif
     if (!p) throw std::bad_alloc();
     Block* b = static_cast<Block*>(p);
     b->next = head_;

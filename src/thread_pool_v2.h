@@ -32,6 +32,7 @@
 //   - SMT-stride-aware tid_to_processor (physical cores first).
 
 #include "cpu_features.h"
+#include "nnrconf.h"  // Provides _aligned_malloc/_aligned_free polyfill on non-Windows.
 
 #include <atomic>
 #include <thread>
@@ -39,6 +40,7 @@
 #include <algorithm>
 #include <climits>
 #include <memory>
+#include "aligned_alloc.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -168,8 +170,8 @@ public:
     void ensure_scratch(size_t bytes) {
         if (bytes <= scratch_size_) return;
         for (int i = 0; i < nthreads_; ++i) {
-            _aligned_free(scratch_[i]);
-            scratch_[i] = _aligned_malloc(bytes, 64);
+            nnr_aligned_free(scratch_[i]);
+            scratch_[i] = nnr_aligned_alloc(bytes, 64);
         }
         scratch_size_ = bytes;
     }
@@ -218,13 +220,17 @@ private:
     int task_end_ = 0;
     int task_nactive_ = 0;
     int task_nshards_ = 0;
-    unsigned dispatch_epoch_ = 0;
+    int nwoken_ = 0;
+    // exit_ / dispatch_epoch_ are atomic: both are read by workers concurrently
+    // with main-thread writes. Plain-type reads across threads are a C++ data
+    // race (UB) and TSan flags them; x86 TSO papers over it in practice.
+    std::atomic<unsigned> dispatch_epoch_{0};
 
     shard_t shards_[MAX_SHARDS];
 
     alignas(64) std::atomic<int> startup_count_{0};
     alignas(64) std::atomic<bool> sleeping_{true};
-    bool exit_ = false;
+    std::atomic<bool> exit_{false};
 
     static bool detect_monitorx() {
 #ifdef NNR_ARCH_X64
@@ -344,7 +350,20 @@ private:
 
     ~thread_pool_t() {
         if (nworkers_ > 0) {
-            exit_ = true;
+            // Wait for the last dispatch's workers to finish before tearing down.
+            // dispatch_*()'s barrier already covers workers [1..nwoken_); this is
+            // a defensive no-op in well-formed code that closes process-exit
+            // races where a worker is still mid-store in worker_done_ or
+            // otherwise touching shared state (scratch, task_ctx_, shards_)
+            // when the Meyers singleton dtor runs.
+            unsigned last_epoch = dispatch_epoch_.load(std::memory_order_acquire);
+            if (last_epoch > 0) {
+                for (int t = 1; t < nwoken_; ++t) {
+                    while (worker_done_[t - 1].epoch.load(std::memory_order_acquire) < last_epoch)
+                        POOL_SPIN_PAUSE();
+                }
+            }
+            exit_.store(true, std::memory_order_release);
             for (int g = 0; g < ngroups_; ++g) {
                 groups_[g].gen.store(UINT_MAX, std::memory_order_release);
 #ifdef _WIN32
@@ -359,7 +378,7 @@ private:
             threads_.clear();
         }
         for (int i = 0; i < nthreads_; ++i)
-            _aligned_free(scratch_[i]);
+            nnr_aligned_free(scratch_[i]);
     }
 
     thread_pool_t(const thread_pool_t&) = delete;
@@ -425,15 +444,18 @@ private:
                 }
             }
 
-            if (exit_) return;
+            if (exit_.load(std::memory_order_acquire)) return;
 
             if (tid < task_nactive_) {
                 work_fn_(this, tid);
             }
             // Unified barrier via per-worker epoch (matches v1). Each worker
             // writes its own cache line — zero contention. Main reads O(nwoken)
-            // cache lines.
-            worker_done_[tid - 1].epoch.store(dispatch_epoch_, std::memory_order_release);
+            // cache lines. The acquire load on dispatch_epoch_ pairs with main's
+            // acq_rel fetch_add that ran before the gen increment that woke us.
+            worker_done_[tid - 1].epoch.store(
+                dispatch_epoch_.load(std::memory_order_acquire),
+                std::memory_order_release);
         }
     }
 
@@ -517,8 +539,11 @@ private:
         task_begin_   = begin;
         task_end_     = end;
         task_nactive_ = nactive;
+        nwoken_       = nwoken;
         work_fn_      = &work_impl_static<Fn>;
-        unsigned epoch = ++dispatch_epoch_;
+        // acq_rel so workers observe dispatch_epoch_ via the subsequent gen
+        // release increment that wakes them.
+        unsigned epoch = dispatch_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         for (int g = 0; g < groups_needed; ++g)
             groups_[g].gen.fetch_add(1, std::memory_order_release);
@@ -593,8 +618,11 @@ private:
         task_end_     = end;
         task_nactive_ = nactive;
         task_nshards_ = nshards;
+        nwoken_       = nwoken;
         work_fn_      = &work_impl_sharded<Fn>;
-        unsigned epoch = ++dispatch_epoch_;
+        // acq_rel so workers observe dispatch_epoch_ via the subsequent gen
+        // release increment that wakes them.
+        unsigned epoch = dispatch_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         for (int g = 0; g < groups_needed; ++g)
             groups_[g].gen.fetch_add(1, std::memory_order_release);

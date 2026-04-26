@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "tensor_view.h"
 #include "layout_cost.h"
 #include "util.h"
 #include "kernel/pool.h"
@@ -162,6 +163,12 @@ struct AveragePool_operator : public operator_t {
         return true;
     }
 
+    bool supports_strided_output(memory_layout_t format) const override {
+        if (format != memory_layout_t::NHWC) return false;
+        if (outputs.empty() || !outputs[0]) return false;
+        return outputs[0]->ndim == 4 && dilations_are_one();
+    }
+
     float layout_cost(memory_layout_t layout, bool /*input_nhwc*/) const override {
         auto* x = inputs[0];
         auto* y = outputs.empty() ? nullptr : outputs[0];
@@ -170,6 +177,10 @@ struct AveragePool_operator : public operator_t {
         float bytes = (float)C * H * W * 4 + (float)y->dims[1] * y->dims[2] * y->dims[3] * 4;
         if (layout == memory_layout_t::NHWC)
             return bytes / nhwc_patch_util(C);
+        if (layout == memory_layout_t::BLOCKED_16 || layout == memory_layout_t::BLOCKED_8) {
+            int block = (layout == memory_layout_t::BLOCKED_16) ? 16 : 8;
+            return bytes / block_simd_util(C, block);
+        }
         return bytes;
     }
 
@@ -248,6 +259,16 @@ struct AveragePool_operator : public operator_t {
             }
             // NHWC path
             if (x->format == memory_layout_t::NHWC) {
+                if (y->strides_set) {
+                    avgpool_2d_nhwc((const float*)x->data, (float*)y->data,
+                        x->dims[0], x->dims[1], x->dims[2], x->dims[3],
+                        y->dims[2], y->dims[3],
+                        kernels[0], kernels[1], strides[0], strides[1], cpads[0], cpads[1],
+                        count_include_pad != 0,
+                        make_addr(y).elem_stride<float>(3));
+                    y->format = memory_layout_t::NHWC;
+                    return true;
+                }
 #ifdef NNR_ARCH_X64
                 avgpool_2d_nhwc_x64((const float*)x->data, (float*)y->data,
                     x->dims[0], x->dims[1], x->dims[2], x->dims[3],

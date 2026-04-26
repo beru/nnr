@@ -52,8 +52,9 @@ struct SequenceMap_operator : public operator_t {
             // Set body input[0] = current element from input_sequence[0]
             if (!body_input_names.empty()) {
                 tensor_t* t = ctx->search_tensor(body_input_names[0]);
-                if (t && in_seq->tensors[iter])
-                    t->apply(*in_seq->tensors[iter]);
+                if (t && in_seq->tensors[iter]) {
+                    if (!t->apply(*in_seq->tensors[iter])) return false;
+                }
             }
 
             // Set additional body inputs from inputs[1..]
@@ -64,10 +65,11 @@ struct SequenceMap_operator : public operator_t {
                 if (!t) continue;
                 if (add->type == NNR_DATA_TYPE_SEQUENCE) {
                     const sequence_t* add_seq = tensor_get_sequence(add);
-                    if (add_seq && iter < (int)add_seq->tensors.size() && add_seq->tensors[iter])
-                        t->apply(*add_seq->tensors[iter]);
+                    if (add_seq && iter < (int)add_seq->tensors.size() && add_seq->tensors[iter]) {
+                        if (!t->apply(*add_seq->tensors[iter])) return false;
+                    }
                 } else {
-                    t->apply(*add);
+                    if (!t->apply(*add)) return false;
                 }
             }
 

@@ -67,14 +67,60 @@ static inline __m512 silu512_ps(__m512 x) {
     return _mm512_mul_ps(x, sigmoid512_ps(x));
 }
 
+// tanh(x) = 2 * sigmoid(2x) - 1
+// @nnr-meta isa=AVX512 dtype=fp32
+static inline __m512 tanh512_ps(__m512 x) {
+    const __m512 two = _mm512_set1_ps(2.0f);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    __m512 s = sigmoid512_ps(_mm512_mul_ps(two, x));
+    return _mm512_fmsub_ps(two, s, one);
+}
+
 // Apply sigmoid to a contiguous float array (threaded, AVX-512).
 // @nnr-meta isa=AVX512 dtype=fp32
 void sigmoid_avx512(float* data, size_t n);
+
+// Single-threaded inplace sigmoid kernel — for callers that already provide
+// outer parallelism (e.g. scroll strip, conv epilogue).
+// @nnr-meta isa=AVX512 dtype=fp32
+static inline void sigmoid_avx512_kernel(float* data, size_t n) {
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_loadu_ps(data + i);
+        _mm512_storeu_ps(data + i, sigmoid512_ps(v));
+    }
+    for (; i < n; i++)
+        data[i] = 1.0f / (1.0f + expf(-data[i]));
+}
 
 // Apply SiLU (x * sigmoid(x)) in-place (threaded, AVX-512).
 // Reads from src, writes to dst. src == dst for in-place.
 // @nnr-meta isa=AVX512 dtype=fp32
 void silu_avx512(const float* src, float* dst, size_t n);
+
+// Single-threaded SiLU kernel (in-place safe: src == dst OK).
+// @nnr-meta isa=AVX512 dtype=fp32
+static inline void silu_avx512_kernel(const float* src, float* dst, size_t n) {
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_loadu_ps(src + i);
+        _mm512_storeu_ps(dst + i, silu512_ps(v));
+    }
+    for (; i < n; i++)
+        dst[i] = src[i] / (1.0f + expf(-src[i]));
+}
+
+// Single-threaded tanh kernel (in-place safe: src == dst OK).
+// @nnr-meta isa=AVX512 dtype=fp32
+static inline void tanh_avx512_kernel(const float* src, float* dst, size_t n) {
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_loadu_ps(src + i);
+        _mm512_storeu_ps(dst + i, tanh512_ps(v));
+    }
+    for (; i < n; i++)
+        dst[i] = tanhf(src[i]);
+}
 
 // Apply element-wise multiply: dst[i] = a[i] * b[i] (threaded, AVX-512).
 // @nnr-meta isa=AVX512 dtype=fp32

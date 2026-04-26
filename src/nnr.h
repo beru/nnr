@@ -156,34 +156,52 @@ struct tensor_t {
     tensor_t(std::string_view name, data_type_t type, std::span<const int> dims);
     ~tensor_t();
 
+    // `tensor_t` owns `data` when `owns_data == true`. A default copy would
+    // silently alias the buffer and then double-free on destruction, so the
+    // copy operations are deleted. Move operations are also disabled because
+    // several callers hold tensor_t* references that must not be invalidated
+    // by a sudden address change; explicit helpers like `reinit`/`apply` are
+    // the supported way to transfer data.
+    tensor_t(const tensor_t&) = delete;
+    tensor_t& operator=(const tensor_t&) = delete;
+    tensor_t(tensor_t&&) = delete;
+    tensor_t& operator=(tensor_t&&) = delete;
+
     static tensor_t* alloc_from_file(std::string_view filename);
 
-    void reinit(data_type_t type, std::span<const int> dims);
+    // Resizes the tensor. Returns false when the allocation request overflows
+    // SIZE_MAX or when operator new fails; in both cases `data == nullptr` and
+    // `allocation_failed` is set. Callers that reach for `apply()` afterwards
+    // will silently no-op, so propagate the return value rather than assuming
+    // success.
+    [[nodiscard]] bool reinit(data_type_t type, std::span<const int> dims);
     void apply(const void* buf, size_t len);
-    void apply(const tensor_t& t);
+    [[nodiscard]] bool apply(const tensor_t& t);
 
     void dump(bool detail) const;
 
     std::span<const int> dim_span() const { return {dims, static_cast<size_t>(ndim)}; }
-    std::span<const int> stride_span() const { return {strides, static_cast<size_t>(ndim)}; }
+    std::span<const int64_t> stride_span() const { return {strides, static_cast<size_t>(ndim)}; }
 
-    int indices_to_offset(std::span<const int> indices) const
+    int64_t indices_to_offset(std::span<const int> indices) const
     {
-        int offset = 0;
+        int64_t offset = 0;
         for (int i = 0; i < ndim; ++i) {
-            offset += indices[i] * strides[i];
+            offset += static_cast<int64_t>(indices[i]) * strides[i];
         }
         return offset;
     }
 
-    void offset_to_indices(int offset, std::span<int> indices) const
+    void offset_to_indices(int64_t offset, std::span<int> indices) const
     {
         for (int i = ndim - 1; i >= 0; i--) {
-            indices[i] = offset % dims[i];
+            indices[i] = static_cast<int>(offset % dims[i]);
             offset /= dims[i];
         }
     }
 
+    // Return false on allocation failure propagated from reinit(); callers
+    // should abort their reshape() handler in that case.
     bool reshape(std::span<const int> dims, data_type_t type);
 
     bool reshape_identity(const tensor_t* x, data_type_t type);
@@ -214,9 +232,9 @@ struct tensor_t {
         return true;
     }
 
-    void* broadcast_map_address(const tensor_t* y, int offset);
+    void* broadcast_map_address(const tensor_t* y, int64_t offset);
 
-    const void* broadcast_map_address(const tensor_t* y, int offset) const
+    const void* broadcast_map_address(const tensor_t* y, int64_t offset) const
     {
         return (const void*) const_cast<tensor_t*>(this)->broadcast_map_address(y, offset);
     }
@@ -224,12 +242,32 @@ struct tensor_t {
     std::string_view name;
     data_type_t type = NNR_DATA_TYPE_UNDEFINED;
     memory_layout_t format = memory_layout_t::NCHW;
-    int strides[MAX_NDIM] = {};
+    // T3 M1 step 3a — canonical declared layout. Set by graph_optimizer
+    // layout passes (assign_*_layouts) so insert_reorders.cpp and other
+    // post-LAYOUT passes can query the intended layout BEFORE exec time.
+    // The legacy `format` field above is still read/written by ops at
+    // runtime (per the incremental migration in T3 M1); declared_layout
+    // is the type-checked path the spec calls for. Ops migrate to it one
+    // at a time via NNR_EXPLICIT_REORDERS.
+    memory_layout_t declared_layout = memory_layout_t::NCHW;
+    int64_t strides[MAX_NDIM] = {};
     int dims[MAX_NDIM] = {};
     int ndim = 0;
     void* data = nullptr;
     bool owns_data = true;
+    // Set by reinit() (and therefore by the sizing ctor) when an allocation
+    // failed or the size calculation overflowed. Cleared on a successful
+    // reinit. Use this to detect ctor-path failures — new (std::nothrow)
+    // only catches the outer tensor_t allocation, not the inner data buffer.
+    bool allocation_failed = false;
     size_t ndata = 0;
+
+    // True when strides[] holds parent (alias) strides instead of natural
+    // row-major dim products. Producers writing into this tensor must honor
+    // strides[] explicitly; downstream in-place fusion is forbidden. Set by
+    // memory_planner Phase 1b when aliasing into an NHWC channel-Concat
+    // parent buffer with H>1 or W>1.
+    bool strides_set = false;
 
     // Quantization metadata (populated by QDQ fusion or loaders).
     // quant_scale == 0 means "not quantized" — all existing code paths unaffected.
@@ -241,6 +279,15 @@ struct tensor_t {
 
     bool is_quantized() const { return quant_scale != 0.0f || quant_scales != nullptr; }
 
+    // Concat-alias metadata. When set by memory_planner, this tensor is a
+    // sub-region of `concat_parent`'s buffer at byte offset `concat_offset`.
+    // CPU: t->data already points into the parent's pool slot (apply() sets
+    // it directly). GPU backends use these fields to derive an aliased
+    // device pointer (parent's dev_ptr + offset), so producers write
+    // straight into the Concat output and the Concat kernel is a no-op.
+    tensor_t* concat_parent = nullptr;
+    size_t    concat_offset = 0;
+
     void set_quant(float scale, int32_t zp) {
         quant_scale = scale;
         quant_zero_point = zp;
@@ -249,13 +296,10 @@ struct tensor_t {
         quant_zero_points = nullptr;
     }
 
-    void clear_quant() {
-        quant_scale = 0.0f;
-        quant_zero_point = 0;
-        quant_axis = -1;
-        _aligned_free(quant_scales); quant_scales = nullptr;
-        _aligned_free(quant_zero_points); quant_zero_points = nullptr;
-    }
+    // Defined in nnr.cpp: frees the per-channel scales/zero-points using
+    // the portable aligned-allocation wrappers. Kept out of the public
+    // header so downstream users never need the MSVC-only `_aligned_free`.
+    void clear_quant();
 
     void propagate_quant(const tensor_t* src) {
         quant_scale = src->quant_scale;
@@ -267,6 +311,16 @@ struct tensor_t {
 };
 
 void copy_data(tensor_t* y, const tensor_t* x);
+
+// Element stride for dim `d` of tensor `t`. Equal to t->strides[d], which
+// reinit() populates as row-major dim products by default. memory_planner
+// Phase 1b may override these to parent strides when aliasing an NHWC
+// channel-Concat (`strides_set` becomes true). Producer kernels should
+// route through this helper so the strided-output path is just a different
+// stride value, not a different code path.
+inline int64_t tensor_stride(const tensor_t* t, int d) {
+    return t->strides[d];
+}
 
 inline sequence_t* tensor_get_sequence(tensor_t* t) {
     return (t && t->type == NNR_DATA_TYPE_SEQUENCE) ? (sequence_t*)t->data : nullptr;
@@ -329,7 +383,22 @@ struct ring_buf_info_t {
 };
 
 struct operator_t {
+    operator_t() = default;
     virtual ~operator_t() = default;
+    // Polymorphic and owns nothing copyable; delete copy/move so a subclass
+    // slice can't sneak in via a pass-by-value. Matches graph_t/context_t/
+    // tensor_t, which all delete these for the same reason (stable addresses,
+    // span/pool-backed members). Placement-new into the attr_pool is still
+    // fine — it goes through the default ctor, not a copy.
+    operator_t(const operator_t&) = delete;
+    operator_t& operator=(const operator_t&) = delete;
+    operator_t(operator_t&&) = delete;
+    operator_t& operator=(operator_t&&) = delete;
+    // Set by registry_t::solve() to the backend this op was resolved on.
+    // context_t::run() uses this to sync cross-backend tensors (e.g.,
+    // download GPU-resident inputs before a CPU op). Stored as uint8_t so
+    // nnr.h doesn't need to include registry.h (circular).
+    uint8_t resolved_backend = 0;  // backend_t::CPU
     void dump(bool detail) const;
 
     // Attribute accessors — format-agnostic, work on pre-parsed attr store
@@ -395,6 +464,18 @@ struct operator_t {
     // assign_blocked_layouts(). Default: picks cheapest estimate_costs()
     // candidate for the layout and reduces to scalar. Operators with
     // proven hand-tuned formulas (Conv) override this directly.
+    //
+    // Backend contract: the returned cost is for *this op's resolved
+    // backend*. The operator_t* you hold is already backend-specific
+    // (solve_operator dispatched to Conv_operator for CPU, Conv_cuda for
+    // CUDA, etc., based on ctx->preferred_backend at load time). Virtual
+    // dispatch on layout_cost therefore implicitly selects the right
+    // backend's cost formula — no backend parameter is needed.
+    //
+    // Costs are comparable across ops within a single backend, but NOT
+    // across backends: units differ (CPU bandwidth bytes vs CUDA HBM bytes
+    // vs ARM NEON cycles). NNR enforces single-backend-per-run via
+    // ctx->preferred_backend, so cross-backend comparison never arises.
     virtual float layout_cost(memory_layout_t layout, bool input_nhwc) const;
 
     // View ops: output shares input's memory (no copy needed).
@@ -402,6 +483,13 @@ struct operator_t {
     // The memory planner skips allocation for view outputs and extends
     // the source tensor's lifetime instead.
     virtual int view_input_index() const { return -1; }
+
+    // True when this op honors `tensor_t::strides_set` on its output for the
+    // given physical layout. memory_planner uses this to gate NHWC channel-axis
+    // Concat aliasing with strided producers (parent C > local C). Default:
+    // false. Producers must use `tensor_stride(y, 1)` (or equivalent) as LDC
+    // when strides_set is true.
+    virtual bool supports_strided_output(memory_layout_t /*format*/) const { return false; }
 
     // Scrolling tiling support
     virtual scroll_info_t scroll_info() const { return {}; }
@@ -424,6 +512,7 @@ struct operator_t {
     bool folded = false;      // set by constant folding — exec() skipped, output data retained
     bool accelerated = false; // set by oneDNN ops when prim_valid — outputs may be in blocked format
     bool is_fused_silu = false; // Sigmoid fused with following Mul into SiLU (graph optimizer)
+    uint8_t device_tag = 0;   // 0 = CPU/host, >0 = backend_t value that owns output data
     uint8_t layout_mask = LAYOUT_NCHW;  // bitmask of supported memory layouts (default: NCHW only)
 
     // Fused post-op (set by fusion pass in graph_optimizer.cpp)
@@ -509,6 +598,12 @@ struct context_t {
     // Thread count: default = physical cores (hardware_concurrency / smt_stride).
     // Set before prepare()/run(). Use all logical threads (e.g., 24 on 12-core
     // SMT CPU) only for int8 GEMM workloads that benefit from latency hiding.
+    //
+    // PROCESS-GLOBAL: despite being a member of context_t, this mutates the
+    // singleton thread pool's static `configured_threads_`. Call once at
+    // program start, before any context_t::prepare()/run() on any thread.
+    // Concurrent calls race. Prefer the free function nnr::set_global_thread_count().
+    [[deprecated("use nnr::set_global_thread_count(); this is process-global, not per-context")]]
     static void set_num_threads(int n);
 
     // Operator fusion (Conv+BN, Conv+Activation, etc.)
@@ -578,6 +673,11 @@ struct context_t {
     // Set by format loaders: graph input/output names in declaration order
     std::vector<std::string_view> graph_inputs;
     std::vector<std::string_view> graph_outputs;
+    // Resolved tensor_t* for every entry in graph_outputs — populated on the
+    // cold path (first `run()` / `prepare()`) and reused on every subsequent
+    // run so `run_graph_impl` does not linear-scan `map` per output per
+    // inference. Invalidated (cleared) only when the map itself changes.
+    std::vector<tensor_t*> graph_output_tensors;
     // Set by format loaders: tensor names that must not be pooled by memory planner
     std::unordered_set<std::string_view> memory_plan_excluded;
     // Set by format loaders: names of weight/initializer tensors (for graph optimizations)
@@ -586,7 +686,21 @@ struct context_t {
     // Preferred execution backend — CPU (0) by default.
     // Other backends fall back to CPU for ops they don't implement.
     // Use backend_t values from registry.h to set this field.
+#if defined(NNR_USE_CUDA)
+    uint8_t preferred_backend = 1; // backend_t::CUDA
+#else
     uint8_t preferred_backend = 0; // backend_t::CPU
+#endif
+
+    // Multi-backend state — one slot per backend_t value.
+    // Each backend registers its opaque state (gpu_cache_t, format_cache_t, etc.)
+    // during first operator exec. Multiple backends can coexist.
+    struct backend_state_t {
+        void* data = nullptr;                              // backend-specific state
+        void (*free_fn)(void*) = nullptr;                  // destructor
+        void (*writeback_fn)(void*, tensor_t*) = nullptr;  // download device→host
+    };
+    backend_state_t backends[8] = {};
 
     // Called by format loaders to register format-specific model data
     void set_model_handle(void* data, void (*free_fn)(void*)) {
@@ -610,6 +724,13 @@ private:
     void* model_data_ = nullptr;
     void (*model_free_)(void*) = nullptr;
 };
+
+// Configure the singleton thread pool worker count.
+// Process-global: affects all context_t instances in this process.
+// Call once at program start, before any context_t::prepare()/run() runs.
+// Concurrent calls race on the underlying static storage.
+// 0 = auto-detect (hardware_concurrency / smt_stride, i.e., physical cores).
+void set_global_thread_count(int n);
 
 static inline int dim_next(std::span<int> dims, std::span<const int> dim_max)
 {

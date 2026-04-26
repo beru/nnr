@@ -16,10 +16,15 @@ include_directories(
 file(GLOB_RECURSE SRC_FILES ${PROJECT_SOURCE_DIR} *.h *.hpp *.c *.cpp)
 list(FILTER SRC_FILES EXCLUDE REGEX "${PROJECT_SOURCE_DIR}/build/.*")
 list(FILTER SRC_FILES EXCLUDE REGEX "${CMAKE_SOURCE_DIR}/third_party/.*")
+if(NOT NNR_ENABLE_WEBGPU)
+    list(FILTER SRC_FILES EXCLUDE REGEX "${PROJECT_SOURCE_DIR}/backend/webgpu/.*")
+endif()
 
 add_library(nnr
 	${SRC_FILES}
 )
+
+target_include_directories(nnr PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
 
 set_directory_properties(PROPERTIES COMPILE_DEFINITIONS "")
 
@@ -28,11 +33,13 @@ if(WIN32)
 endif()
 
 option(NNR_NO_THREAD_POOL "Disable the thread pool (single-threaded execution)" OFF)
-option(NNR_USE_OPENMP "Use OpenMP for threading instead of custom thread pool" OFF)
 option(NNR_USE_POOL_V2 "Use adaptive dispatch thread pool v2 (default; set OFF for v1 escape hatch)" ON)
 option(NNR_ENABLE_PROFILER "Enable instrumentation profiler (zero overhead when OFF)" OFF)
 option(NNR_USE_XBYAK "Enable Xbyak JIT code generation (x64 only)" ON)
 option(NNR_PROFILE_REORDERS "Dump NHWC/BLOCKED reorder count+bytes+time on exit" OFF)
+option(NNR_USE_CUDA "CUDA backend (NVRTC + WMMA TensorCores, no cuBLAS/cuDNN)" OFF)
+option(NNR_USE_CUPTI "Enable CUPTI per-kernel timing (per-op breakdown during graph replay)" OFF)
+option(NNR_ENABLE_WEBGPU "Build the WebGPU backend (requires third_party/dawn submodule + Python 3)" OFF)
 
 if(NNR_ENABLE_PROFILER)
     target_compile_definitions(nnr PUBLIC NNR_ENABLE_PROFILER)
@@ -47,12 +54,12 @@ if(NNR_USE_XBYAK)
     target_compile_definitions(nnr PUBLIC NNR_USE_XBYAK)
 endif()
 
+if(NNR_ENABLE_WEBGPU)
+    add_subdirectory(backend/webgpu)
+endif()
+
 if(NNR_NO_THREAD_POOL)
     target_compile_definitions(nnr PUBLIC NNR_NO_THREAD_POOL)
-elseif(NNR_USE_OPENMP)
-    find_package(OpenMP REQUIRED)
-    target_compile_definitions(nnr PUBLIC NNR_USE_OPENMP)
-    target_link_libraries(nnr PUBLIC OpenMP::OpenMP_CXX)
 elseif(NNR_USE_POOL_V2)
     target_compile_definitions(nnr PUBLIC NNR_USE_POOL_V2)
 endif()
@@ -72,14 +79,70 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64" OR CMAKE_GENERATOR_PLATFORM ST
     target_compile_definitions(nnr PUBLIC NNR_USE_XBYAK_AARCH64)
 endif()
 
+# --- CUDA backend ---
+# No cuBLAS, no cuDNN. Only the CUDA runtime, NVRTC (runtime kernel compiler),
+# and the driver API (cuLaunchKernel). All GEMM/Conv kernels are hand-written
+# and compiled at runtime (see backend/gpu/cuda/gemm_wmma.h).
+if(NNR_USE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_compile_definitions(nnr PUBLIC NNR_USE_CUDA)
+    target_link_libraries(nnr PUBLIC CUDA::cudart CUDA::nvrtc CUDA::cuda_driver)
+    target_include_directories(nnr PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backend/gpu)
+    # NVRTC compiles kernels at runtime; tell it where CUDA's bundled headers
+    # live (mma.h, cuda_fp16.h, etc.) via an -I option embedded as a macro.
+    # Note: CUDAToolkit_INCLUDE_DIRS may be a list on some systems; first entry
+    # is the standard include dir.
+    list(GET CUDAToolkit_INCLUDE_DIRS 0 NNR_CUDA_INC_FIRST)
+    target_compile_definitions(nnr PRIVATE
+        "NNR_CUDA_INCLUDE_DIR=\"${NNR_CUDA_INC_FIRST}\"")
+
+    # CUPTI ships with the CUDA Toolkit at extras/CUPTI/.
+    # Enable to record per-kernel GPU timestamps during cudaGraphLaunch
+    # (replaces the host-clock 0.0 ms entries seen in nnr_raw.csv during replay).
+    if(NNR_USE_CUPTI)
+        get_filename_component(NNR_CUDA_TOOLKIT_ROOT
+            "${NNR_CUDA_INC_FIRST}/.." ABSOLUTE)
+        set(NNR_CUPTI_DIR "${NNR_CUDA_TOOLKIT_ROOT}/extras/CUPTI")
+        if(NOT EXISTS "${NNR_CUPTI_DIR}/include/cupti.h")
+            message(FATAL_ERROR
+                "NNR_USE_CUPTI=ON but cupti.h not found at ${NNR_CUPTI_DIR}/include/")
+        endif()
+        find_library(NNR_CUPTI_LIB cupti
+            HINTS "${NNR_CUPTI_DIR}/lib64" "${NNR_CUPTI_DIR}/lib"
+            NO_DEFAULT_PATH)
+        if(NOT NNR_CUPTI_LIB)
+            message(FATAL_ERROR
+                "NNR_USE_CUPTI=ON but cupti.lib not found in ${NNR_CUPTI_DIR}/lib64/")
+        endif()
+        target_include_directories(nnr PRIVATE "${NNR_CUPTI_DIR}/include")
+        target_link_libraries(nnr PUBLIC "${NNR_CUPTI_LIB}")
+        target_compile_definitions(nnr PUBLIC NNR_USE_CUPTI)
+        message(STATUS "NNR: CUPTI enabled — ${NNR_CUPTI_LIB}")
+    endif()
+endif()
+
 set_property(TARGET nnr PROPERTY CXX_STANDARD 23)
 
 if(MSVC)
 	add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 	target_compile_options(nnr PRIVATE /MP)
 	target_compile_options(nnr PRIVATE /Zc:preprocessor)
-	if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+	if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64" OR CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64")
+		# armv8.6 enables dotprod (SDOT/UDOT), fp16 arith, i8mm (SMMLA), bf16 (BFDOT) intrinsics.
+		# Runtime CPU-feature gating still protects execution on older ARM chips.
+		target_compile_options(nnr PUBLIC /arch:armv8.6)
+	else()
 		target_compile_options(nnr PRIVATE /arch:AVX2)
 	endif()
 	target_link_libraries(nnr PUBLIC synchronization)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+	# Pi 5 is the ARM execution floor: ARMv8.2-A + dotprod (SDOT/UDOT) + fp16 arithmetic.
+	# We also declare +i8mm at compile time so kernels that explicitly use SMMLA/UMMLA
+	# intrinsics can compile; those kernels MUST be runtime-gated via has_neon_i8mm()
+	# so the resulting binary never executes i8mm instructions on Pi 5. The compiler
+	# does not spontaneously auto-vectorize scalar code with SMMLA (it's a 2×2×8 matrix
+	# instruction, no common scalar pattern matches it), so this flag is safe for Pi 5.
+	# +fp16fml enables `vfmlalq_{low,high,lane_low,lane_high}_f16` (FP16 widening FMAs).
+	# Cortex-A76 (Pi 5) and both Oryon generations include FHM/FP16FML; safe by default.
+	target_compile_options(nnr PUBLIC -march=armv8.2-a+dotprod+fp16+fp16fml+i8mm)
 endif()

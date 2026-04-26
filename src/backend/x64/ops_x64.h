@@ -85,6 +85,24 @@ inline void affine_avx512(float* dst, const float* src, int len, float a, float 
         dst[i] = a * src[i] + b;
 }
 
+// Fused affine + Relu: dst[i] = max(0, a*src[i] + b). Single pass — avoids
+// the second sweep over dst that a separate Relu post_fn would require.
+// @nnr-meta isa=AVX512 dtype=fp32 fusion=bn_relu
+inline void affine_relu_avx512(float* dst, const float* src, int len, float a, float b) {
+    __m512 va = _mm512_set1_ps(a);
+    __m512 vb = _mm512_set1_ps(b);
+    __m512 vz = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= len; i += 16) {
+        __m512 vy = _mm512_fmadd_ps(va, _mm512_loadu_ps(src + i), vb);
+        _mm512_storeu_ps(dst + i, _mm512_max_ps(vy, vz));
+    }
+    for (; i < len; i++) {
+        float v = a * src[i] + b;
+        dst[i] = v > 0.0f ? v : 0.0f;
+    }
+}
+
 // --- BatchNormalization ---
 
 // Vectorized channel affine: dst[c] = alpha[c] * src[c] + beta[c], 16 channels at a time.
@@ -166,6 +184,22 @@ inline void add_vec_avx512(float* dst, const float* a, const float* b, size_t st
         _mm512_storeu_ps(dst + i, _mm512_add_ps(va, vb));
     }
     for (; i < end; ++i) dst[i] = a[i] + b[i];
+}
+
+// Fused: dst = max(0, a + b). Single-pass, no second sweep over the output.
+// @nnr-meta isa=AVX512 dtype=fp32 fusion=add_relu
+inline void add_relu_vec_avx512(float* dst, const float* a, const float* b, size_t start, size_t end) {
+    const __m512 zero = _mm512_setzero_ps();
+    size_t i = start;
+    for (; i + 16 <= end; i += 16) {
+        __m512 va = _mm512_loadu_ps(a + i);
+        __m512 vb = _mm512_loadu_ps(b + i);
+        _mm512_storeu_ps(dst + i, _mm512_max_ps(_mm512_add_ps(va, vb), zero));
+    }
+    for (; i < end; ++i) {
+        float v = a[i] + b[i];
+        dst[i] = v > 0.0f ? v : 0.0f;
+    }
 }
 
 // --- Bias broadcast Add: dst[r*N+i] = src[r*N+i] + bias[i] ---

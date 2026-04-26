@@ -167,20 +167,25 @@ inline void avgpool_2d(const T* input, T* output,
 
 // NHWC maxpool: input/output [N, H, W, C], channels contiguous for SIMD.
 template <typename T>
+// `out_ldc` (default 0 → C): output per-spatial-position stride. Set to
+// parent_C for NHWC channel-axis Concat alias where this MaxPool writes a
+// sub-channel stripe into a wider parent buffer.
 inline void maxpool_2d_nhwc(const T* input, T* output,
     int N, int C, int iH, int iW, int oH, int oW,
-    int kH, int kW, int sH, int sW, int pH, int pW)
+    int kH, int kW, int sH, int sW, int pH, int pW,
+    int out_ldc = 0)
 {
+    if (out_ldc == 0) out_ldc = C;
     nnr::for_static(0, N * oH, N * oH > 4, [&](int noh) {
         int n = noh / oH, oh = noh % oH;
         const T* xn = input + (size_t)n * iH * iW * C;
-        T* yn = output + (size_t)n * oH * oW * C;
+        T* yn = output + (size_t)n * oH * oW * out_ldc;
         int ih0 = oh * sH - pH;
         int kh0 = std::max(0, -ih0), kh1 = std::min(kH, iH - ih0);
         for (int ow = 0; ow < oW; ow++) {
             int iw0 = ow * sW - pW;
             int kw0 = std::max(0, -iw0), kw1 = std::min(kW, iW - iw0);
-            T* out = yn + (oh * oW + ow) * C;
+            T* out = yn + (oh * oW + ow) * out_ldc;
             for (int c = 0; c < C; c++) {
                 T maxv = std::numeric_limits<T>::lowest();
                 for (int kh = kh0; kh < kh1; kh++)
@@ -195,20 +200,23 @@ inline void maxpool_2d_nhwc(const T* input, T* output,
 }
 
 // NHWC avgpool: input/output [N, H, W, C], channels contiguous for SIMD.
+// `out_ldc` (default 0 → C): NHWC channel-axis Concat alias support — output
+// per-spatial-position stride is parent_C instead of local C.
 template <typename T>
 inline void avgpool_2d_nhwc(const T* input, T* output,
     int N, int C, int iH, int iW, int oH, int oW,
     int kH, int kW, int sH, int sW, int pH, int pW,
-    bool count_include_pad = false)
+    bool count_include_pad = false, int out_ldc = 0)
 {
+    if (out_ldc == 0) out_ldc = C;
     nnr::for_static(0, N * oH, N * oH > 4, [&](int noh) {
         int n = noh / oH, oh = noh % oH;
         const T* xn = input + (size_t)n * iH * iW * C;
-        T* yn = output + (size_t)n * oH * oW * C;
+        T* yn = output + (size_t)n * oH * oW * out_ldc;
         int ih0 = oh * sH - pH;
         for (int ow = 0; ow < oW; ow++) {
             int iw0 = ow * sW - pW;
-            T* out = yn + (oh * oW + ow) * C;
+            T* out = yn + (oh * oW + ow) * out_ldc;
             int valid = 0;
             for (int kh = 0; kh < kH; kh++) {
                 int ih = ih0 + kh;

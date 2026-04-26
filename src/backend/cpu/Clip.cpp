@@ -68,6 +68,14 @@ struct Clip_operator : public operator_t {
 
     scroll_info_t scroll_info() const override {
         if (inputs[0]->ndim < 3) return {};
+        // exec_strip addresses x and y with the same per-channel-block
+        // stride. If declared_layouts disagree (e.g., x BLOCKED but y
+        // NCHW because Phase-4-style propagation didn't reach this Clip),
+        // the ring buffer sized for x's layout doesn't match y's stride
+        // and reads/writes mis-stride into unmapped memory. Bail so the
+        // whole-tensor exec path handles it instead.
+        if (outputs.empty() || !outputs[0]) return {};
+        if (inputs[0]->declared_layout != outputs[0]->declared_layout) return {};
         return { .scrollable = true };
     }
 
@@ -84,11 +92,23 @@ struct Clip_operator : public operator_t {
         int iH = x->dims[x->ndim - 2];
         int W = x->dims[x->ndim - 1];
         int oH = y->dims[y->ndim - 2];
-        int outer = (int)(x->ndata / (iH * W));
+        // Empty spatial dims are legal in ONNX (dynamic axes); guard against
+        // divide-by-zero before the iH*W / iH*row_elems divisions below.
+        if (iH <= 0 || W <= 0) return true;
         int clamp_H = ring_out.orig_H > 0 ? ring_out.orig_H : oH;
         int out_end = std::min(out_row_start + out_rows, clamp_H);
-        int count = (out_end - out_row_start) * W;
-        if (count <= 0) return true;
+        int rows = out_end - out_row_start;
+        if (rows <= 0) return true;
+        // BLOCKED layout interleaves 16 (or 8) channels per spatial step,
+        // so the row stride per channel block is W*block, and the outer
+        // iteration is N*(C/block) blocks. NCHW: row stride = W, outer = N*C.
+        bool blocked = (y->declared_layout == NATIVE_BLOCKED_FMT);
+        int block = blocked ? NATIVE_BLOCK : 1;
+        int row_elems = W * block;
+        int outer = blocked
+            ? (int)(x->ndata / (iH * row_elems))   // N * (C/block)
+            : (int)(x->ndata / (iH * W));          // N * C
+        int count = rows * row_elems;
         auto strip_fn = [&](const float* src, float* dst, int n) {
 #ifdef NNR_ARCH_ARM64
             neon::clip(src, dst, (size_t)n, lo, hi);
@@ -98,8 +118,8 @@ struct Clip_operator : public operator_t {
 #endif
         };
         nnr::for_static(0, outer, outer > 4, [&](int nc) {
-            const float* src = px + (size_t)nc * iH * W + (size_t)out_row_start * W;
-            float* dst = py + (size_t)nc * oH * W + (size_t)out_row_start * W;
+            const float* src = px + (size_t)nc * iH * row_elems + (size_t)out_row_start * row_elems;
+            float* dst = py + (size_t)nc * oH * row_elems + (size_t)out_row_start * row_elems;
             strip_fn(src, dst, count);
         });
         return true;

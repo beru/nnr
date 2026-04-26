@@ -57,6 +57,20 @@ struct DFT_operator : public operator_t {
         // Determine if input is complex (last dim == 2) or real
         bool input_complex = x->dims[x->ndim - 1] == 2;
 
+        // Inverse + onesided + complex input: IRFFT. Output length along axis is
+        // 2*(N-1) (or user-provided dft_length); output is real so last dim = 1.
+        if (is_inverse && is_onesided && input_complex) {
+            int N = x->dims[axis];
+            if (inputs.size() < 2 || !inputs[1] || inputs[1]->ndata == 0)
+                dft_length = 2 * (N - 1);
+
+            small_vector<int> dims(x->ndim);
+            for (int d = 0; d < x->ndim; ++d) dims[d] = x->dims[d];
+            dims[axis] = dft_length;
+            dims[x->ndim - 1] = 1;
+            return y->reshape(dims, x->type);
+        }
+
         small_vector<int> dims(x->ndim);
         for (int d = 0; d < x->ndim; ++d)
             dims[d] = x->dims[d];
@@ -86,6 +100,53 @@ struct DFT_operator : public operator_t {
         int dft_length = get_dft_length(axis);
 
         bool input_complex = x->dims[x->ndim - 1] == 2;
+
+        // IRFFT: onesided complex input -> real full-length output.
+        if (is_inverse && is_onesided && input_complex) {
+            if (inputs.size() < 2 || !inputs[1] || inputs[1]->ndata == 0)
+                dft_length = 2 * (N - 1);
+            const int N_full = dft_length;
+            size_t outer = 1;
+            for (int d = 0; d < axis; ++d) outer *= x->dims[d];
+            size_t inner = 1;
+            for (int d = axis + 1; d < x->ndim - 1; ++d) inner *= x->dims[d];
+
+            memset(py, 0, y->ndata * sizeof(T));
+            const int Nlast = N - 1;  // index of Nyquist bin in onesided input
+
+            for (size_t o = 0; o < outer; ++o) {
+                for (size_t i = 0; i < inner; ++i) {
+                    for (int k = 0; k < N_full; ++k) {
+                        double acc = 0.0;
+                        // n = 0 (DC)
+                        size_t idx0 = (o * N + 0) * inner * 2 + i * 2;
+                        acc += (double)px[idx0];
+                        // n = N-1 (Nyquist) — only if N_full is even
+                        if ((N_full & 1) == 0 && Nlast > 0) {
+                            size_t idxN = (o * N + Nlast) * inner * 2 + i * 2;
+                            double sign = (k & 1) ? -1.0 : 1.0;
+                            acc += sign * (double)px[idxN];
+                        }
+                        // n = 1..Nlast-1: contribute 2 * Re(X[n] * e^(j*alpha))
+                        int top = ((N_full & 1) == 0) ? (Nlast - 1) : Nlast;
+                        // if N_full is odd, there's no Nyquist; include up to Nlast.
+                        for (int n = 1; n <= top; ++n) {
+                            size_t idx = (o * N + n) * inner * 2 + i * 2;
+                            double xr = (double)px[idx];
+                            double xi = (double)px[idx + 1];
+                            double alpha = 2.0 * PI * (double)k * (double)n / (double)N_full;
+                            double ca = std::cos(alpha);
+                            double sa = std::sin(alpha);
+                            acc += 2.0 * (xr * ca - xi * sa);
+                        }
+                        acc /= (double)N_full;
+                        size_t out_idx = (o * N_full + k) * inner + i;
+                        py[out_idx] = (T)acc;
+                    }
+                }
+            }
+            return true;
+        }
 
         int out_length = is_onesided && !is_inverse ? dft_length / 2 + 1 : dft_length;
 

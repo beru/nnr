@@ -12,11 +12,13 @@ namespace {
 
 struct DequantizeLinear_operator : public operator_t {
     int axis = 1;
+    int block_size = 0;
 
     bool init() override {
         if (inputs.size() < 2 || outputs.size() != 1)
             return false;
         axis = attribute(attr_key_t::axis, (int32_t)1);
+        block_size = attribute(attr_key_t::block_size, (int32_t)0);
         layout_mask = LAYOUT_ALL;  // element-wise, layout-agnostic
         return true;
     }
@@ -178,6 +180,55 @@ struct DequantizeLinear_operator : public operator_t {
                     py[i] = ((float)px[i] - (float)zero) * scale;
             }
             return true;
+        }
+
+        // Blocked dequantization: x_scale has the same ndim as x, with dims[axis]
+        // reduced by block_size. Scales/zero-points broadcast over each block.
+        if (block_size > 0 && x_scale->ndim == x->ndim
+            && x_scale->dims[caxis] * block_size == x->dims[caxis]) {
+            const float* scales = (const float*)x_scale->data;
+            float* py = (float*)y->data;
+            const int ndim = x->ndim;
+            int scale_strides[MAX_NDIM];
+            scale_strides[ndim - 1] = 1;
+            for (int d = ndim - 2; d >= 0; --d)
+                scale_strides[d] = scale_strides[d + 1] * x_scale->dims[d + 1];
+
+            int x_idx[MAX_NDIM] = {0};
+            auto advance = [&]() {
+                for (int d = ndim - 1; d >= 0; --d) {
+                    if (++x_idx[d] < x->dims[d]) return;
+                    x_idx[d] = 0;
+                }
+            };
+            auto scale_idx = [&]() {
+                int s = 0;
+                for (int d = 0; d < ndim; ++d) {
+                    int c = (d == caxis) ? (x_idx[d] / block_size) : x_idx[d];
+                    s += c * scale_strides[d];
+                }
+                return s;
+            };
+
+            auto run = [&](auto tag) {
+                using T = decltype(tag);
+                const T* px = (const T*)x->data;
+                const T* zeros = x_zero ? (const T*)x_zero->data : nullptr;
+                for (size_t i = 0; i < x->ndata; ++i, advance()) {
+                    int si = scale_idx();
+                    T z = zeros ? zeros[si] : T(0);
+                    py[i] = ((float)px[i] - (float)z) * scales[si];
+                }
+            };
+
+            switch (x->type) {
+            case NNR_DATA_TYPE_UINT8:  run((uint8_t)0); return true;
+            case NNR_DATA_TYPE_INT8:   run((int8_t)0);  return true;
+            case NNR_DATA_TYPE_UINT16: run((uint16_t)0); return true;
+            case NNR_DATA_TYPE_INT16:  run((int16_t)0);  return true;
+            case NNR_DATA_TYPE_INT32:  run((int32_t)0);  return true;
+            default: break;
+            }
         }
 
         int axis_size = x->dims[caxis];

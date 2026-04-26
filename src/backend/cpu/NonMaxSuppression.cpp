@@ -162,26 +162,19 @@ struct NonMaxSuppression_operator : public operator_t {
             }
         }
 
-        // Write results into the pre-allocated buffer (from reshape).
-        // Do NOT call reinit() — downstream nodes have shapes based on the
-        // reshape-time max_output size.  Shrinking the buffer here would cause
-        // Slice/Gather to read past the end of the new smaller allocation.
+        // Shape the output to the actual detection count. ONNX spec: output is
+        // dynamic shape (num_selected, 3); downstream ops re-run reshape() each
+        // graph iteration so they see the current shape.
         int nresults = (int)results.size();
+        int dims[2] = {nresults > 0 ? nresults : 0, 3};
+        if (!outputs[0]->reshape(std::span<const int>(dims, 2), NNR_DATA_TYPE_INT64))
+            return false;
         int64_t* py = (int64_t*)outputs[0]->data;
-        if (!py) return false;
-        int max_rows = outputs[0]->dims[0];
-        for (int i = 0; i < nresults && i < max_rows; ++i) {
+        for (int i = 0; i < nresults; ++i) {
             py[i * 3 + 0] = results[i].batch;
             py[i * 3 + 1] = results[i].cls;
             py[i * 3 + 2] = results[i].idx;
         }
-        // Zero-fill unused rows so downstream Gather reads valid indices (0)
-        for (int i = nresults; i < max_rows; ++i) {
-            py[i * 3 + 0] = 0;
-            py[i * 3 + 1] = 0;
-            py[i * 3 + 2] = 0;
-        }
-
         return true;
     }
 };

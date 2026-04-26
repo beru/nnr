@@ -210,6 +210,10 @@ inline void dgemm(int n, int m, int o, const float* __restrict A, const float* _
 
     // Small-K path: A[N,K] is small (fits in L1), B[K,M] streams through L2.
     // 8-row register blocking gives 8 independent FMA chains.
+    // Threshold o<=48 is empirically better than o<=64: at o=64 with large m
+    // (e.g. multi-head attention M=1500 K=64 N=1500), the non-packed inner loop
+    // re-reads B (n/8)×(m/4) times which thrashes L2 — the default packed-tile
+    // path wins there. Don't raise this above 48 without a per-shape sweep.
     if (o <= 48 && m >= 32) {
         int mchunks = (m + 3) / 4;
         nnr::for_static(0, mchunks, mchunks >= 32 && (int64_t)n * m * o > (1 << 22), [&](int jc) {

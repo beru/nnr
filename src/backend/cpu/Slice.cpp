@@ -330,6 +330,14 @@ struct Slice_operator : public operator_t {
         // (owns_data=false, data=nullptr/view) and extended the source's lifetime.
         // On the first run (before planning), owns_data=true → use memcpy.
         if (is_contiguous_view_ && !y->owns_data) {
+            // x->dims may have shrunk since reshape() was last called — e.g.
+            // an upstream NonMaxSuppression resizes its output during exec()
+            // to the actual detection count. Re-derive y's shape from x's
+            // current dims (and the slice params) so downstream ops see the
+            // live ndata. Without this, ndata stays at the prepare-time
+            // upper bound and reads run past the live region into uncommitted
+            // pool memory (ssd-12 NMS→Slice→Gather crash).
+            if (!reshape()) return false;
             const size_t sz = data_type_sizeof(x);
             size_t offset = 0;
             for (int d = 0; d < ndim; d++)

@@ -52,12 +52,20 @@ struct If_operator : public operator_t {
         auto& names = px[0] ? then_output_names : else_output_names;
         for (auto* n : g->nodes) {
             if (!n->reshape()) continue;
-            n->exec();
+            // Guard against ops dereferencing nulls when an upstream branch
+            // node failed reshape — same pattern as Loop's body iteration.
+            bool safe = true;
+            for (auto* t : n->inputs)
+                if (t && (!t->data || t->type == NNR_DATA_TYPE_UNDEFINED)) { safe = false; break; }
+            for (auto* t : n->outputs)
+                if (t && !t->data && t->type != NNR_DATA_TYPE_UNDEFINED) { safe = false; break; }
+            if (safe) n->exec();
         }
         for (size_t i = 0; i < std::min(names.size(), (size_t)outputs.size()); ++i) {
             tensor_t* src = ctx->search_tensor(names[i]);
-            if (src && outputs[i] && src->data)
-                outputs[i]->apply(*src);
+            if (src && outputs[i] && src->data) {
+                if (!outputs[i]->apply(*src)) return false;
+            }
         }
         return true;
     }

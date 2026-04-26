@@ -243,3 +243,88 @@ bool exec_depthwise_2d_nchwc(tensor_t* y, const tensor_t* x,
     y->format = NATIVE_BLOCKED_FMT;
     return true;
 }
+
+// Strip-mode depthwise NCHWc.  Iterates oh in [out_row_start, out_end).
+// iH_logical is the un-ringed input height for boundary clamping; the
+// ring-buffer virtual-pointer trick handles per-plane addressing.
+bool exec_depthwise_2d_nchwc_strip(tensor_t* y, const tensor_t* x,
+    const float* w_repacked, const float* bias_packed,
+    int out_row_start, int out_end, int iH_logical)
+{
+    NNR_PROFILE_SCOPE("depthwise_nchwc_strip");
+    constexpr int block = NATIVE_BLOCK;
+    const int N = y->dims[0], C = y->dims[1];
+    const int oH = y->dims[2], oW = y->dims[3];   // oH may be ring_H
+    const int iH = iH_logical;                    // logical iH for bounds
+    const int iW = x->dims[3];
+    const int kH = inputs[1]->dims[2], kW = inputs[1]->dims[3];
+    const int sH = strides[0], sW = strides[1];
+    const int pH = cpads[0], pW = cpads[1];
+    const int Cb = C / block;
+
+    const float* xd = (const float*)x->data;
+    float* yd = (float*)y->data;
+    // Per-plane strides use the (possibly ringed) tensor heights so that
+    // the virtual-pointer trick lands writes/reads in the correct ring slot.
+    const size_t in_spatial  = (size_t)x->dims[2] * iW * block;
+    const size_t out_spatial = (size_t)oH * oW * block;
+
+    const int strip_rows = out_end - out_row_start;
+    if (strip_rows <= 0) return true;
+
+    const int NCb = N * Cb;
+    nnr::for_static(0, NCb, NCb > 1, [&](int ncb) {
+        const int cb = ncb % Cb;
+        const float* inp = xd + (size_t)ncb * in_spatial;
+        float* out = yd + (size_t)ncb * out_spatial;
+        const float* wt = w_repacked + (size_t)cb * kH * kW * block;
+        const float* bi = bias_packed + cb * block;
+
+#ifdef NNR_ARCH_X64
+        if (has_avx512()) {
+            for (int oh = out_row_start; oh < out_end; ++oh)
+                for (int ow = 0; ow < oW; ++ow)
+                    nnr::depthwise_nchwc_pixel_avx512(out, inp, wt, bi,
+                        kH, kW, iH, iW, oW, block, oh, ow, sH, sW, pH, pW);
+        } else
+#elifdef NNR_ARCH_ARM64
+        if (true) {
+            for (int oh = out_row_start; oh < out_end; ++oh)
+                for (int ow = 0; ow < oW; ++ow)
+                    nnr::depthwise_nchwc_pixel_neon(out, inp, wt, bi,
+                        kH, kW, iH, iW, oW, block, oh, ow, sH, sW, pH, pW);
+        } else
+#endif
+        {
+            for (int oh = out_row_start; oh < out_end; ++oh) {
+                int ih0 = oh * sH - pH;
+                int kh0 = std::max(0, -ih0), kh1 = std::min(kH, iH - ih0);
+                for (int ow = 0; ow < oW; ++ow) {
+                    int iw0 = ow * sW - pW;
+                    int kw0 = std::max(0, -iw0), kw1 = std::min(kW, iW - iw0);
+                    float acc[block];
+                    for (int c = 0; c < block; ++c) acc[c] = bi[c];
+                    for (int kh = kh0; kh < kh1; ++kh)
+                        for (int kw = kw0; kw < kw1; ++kw) {
+                            const float* xi = &inp[((ih0 + kh) * iW + (iw0 + kw)) * block];
+                            const float* wi = &wt[(kh * kW + kw) * block];
+                            for (int c = 0; c < block; ++c)
+                                acc[c] += xi[c] * wi[c];
+                        }
+                    float* dst = &out[(oh * oW + ow) * block];
+                    for (int c = 0; c < block; ++c) dst[c] = acc[c];
+                }
+            }
+        }
+
+        // Per-Cb fused post-op on this strip's output rows.
+        if (post_fn) {
+            const int strip_total = strip_rows * oW * block;
+            float* strip_out = &out[(size_t)out_row_start * oW * block];
+            int toff = (int)(strip_out - yd);
+            post_fn(strip_out, 1, strip_total, strip_total, fused_op, nullptr, toff);
+        }
+    });
+
+    return true;
+}

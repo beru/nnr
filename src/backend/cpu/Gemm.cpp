@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "aligned_alloc.h"
 #include "util.h"
 #include "allocator.h"
 #include "kernel/gemm.h"
@@ -25,6 +26,7 @@ struct Gemm_operator : public operator_t {
 
     std::vector<float> b_packed;  // pre-packed B weights (float32)
     std::vector<uint16_t> b_packed_bf16;  // VNNI-packed BF16 weights for VDPBF16PS
+    std::vector<uint16_t> b_packed_fp16;  // K-major FP16-packed weights for gemm_fp16_neon
 
     bool init() override {
         if (!(inputs.size() >= 2 && outputs.size() == 1)) {
@@ -79,7 +81,7 @@ struct Gemm_operator : public operator_t {
                 float* tmp = nullptr;
                 const float* pb;
                 if (b->type == NNR_DATA_TYPE_FLOAT16) {
-                    tmp = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                    tmp = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                     convert_f16_to_f32(tmp, (const float16_t*)b->data, bn);
                     pb = tmp;
                 } else {
@@ -88,17 +90,41 @@ struct Gemm_operator : public operator_t {
                 b_packed.resize(psz);
                 if (transB) {
                     // B is [n × k], transpose to [k × n] then pack
-                    float* bt = (float*)_aligned_malloc(bn * sizeof(float), 64);
+                    float* bt = (float*)nnr_aligned_alloc(bn * sizeof(float), 64);
                     for (int i = 0; i < n; i++)
                         for (int j = 0; j < k; j++)
                             bt[(size_t)j * n + i] = pb[(size_t)i * k + j];
                     pack_b(b_packed.data(), bt, k, n);
-                    _aligned_free(bt);
+                    nnr_aligned_free(bt);
                 } else {
                     // B is [k × n], pack directly
                     pack_b(b_packed.data(), pb, k, n);
                 }
-                _aligned_free(tmp);
+                nnr_aligned_free(tmp);
+            }
+        }
+
+        // Pre-pack FP16 weights in the gemm_fp16_neon K-major layout.
+        // Allows the FP16 fast path in exec_f16_as_f32() to skip both the
+        // B FP16→FP32 conversion and the FP32 pack on every call.
+        b_packed_fp16.clear();
+        if (b->type == NNR_DATA_TYPE_FLOAT16 && !transA
+            && ctx && ctx->initializer_names.count(b->name)) {
+            size_t psz = pack_b_fp16_size(k, n);
+            if (psz > 0) {
+                const uint16_t* pb = (const uint16_t*)b->data;
+                b_packed_fp16.resize(psz / sizeof(uint16_t));
+                if (transB) {
+                    size_t bn = (size_t)k * n;
+                    uint16_t* bt = (uint16_t*)_aligned_malloc(bn * sizeof(uint16_t), 64);
+                    for (int i = 0; i < n; i++)
+                        for (int j = 0; j < k; j++)
+                            bt[(size_t)j * n + i] = pb[(size_t)i * k + j];
+                    pack_b_fp16(b_packed_fp16.data(), bt, k, n);
+                    _aligned_free(bt);
+                } else {
+                    pack_b_fp16(b_packed_fp16.data(), pb, k, n);
+                }
             }
         }
 
@@ -110,14 +136,14 @@ struct Gemm_operator : public operator_t {
             const uint16_t* pb = (const uint16_t*)b->data;
             if (transB) {
                 // B is [n × k], transpose to [k × n] then pack
-                uint16_t* bt = (uint16_t*)_aligned_malloc((size_t)k * n * sizeof(uint16_t), 64);
+                uint16_t* bt = (uint16_t*)nnr_aligned_alloc((size_t)k * n * sizeof(uint16_t), 64);
                 for (int i = 0; i < n; i++)
                     for (int j = 0; j < k; j++)
                         bt[(size_t)j * n + i] = pb[(size_t)i * k + j];
                 size_t psz = bf16::pack_b_bf16_size(k, n);
                 b_packed_bf16.resize(psz);
                 bf16::pack_b_bf16(b_packed_bf16.data(), bt, k, n);
-                _aligned_free(bt);
+                nnr_aligned_free(bt);
             } else {
                 size_t psz = bf16::pack_b_bf16_size(k, n);
                 b_packed_bf16.resize(psz);
@@ -299,6 +325,31 @@ struct Gemm_operator : public operator_t {
         const tensor_t* a = inputs[0];
         const tensor_t* b = inputs[1];
         const tensor_t* c = (inputs.size() > 2) ? inputs[2] : nullptr;
+
+        // Native FP16 GEMM path: FP16 A × packed FP16 B → FP32 Y, then alpha/
+        // beta/post in FP32 and FP32→FP16 on output. Gated on having the FP16
+        // pack (built in reshape when ARM64 + has_neon_fp16() + initializer B
+        // + !transA).
+        if (!b_packed_fp16.empty() && !transA) {
+            float* y_f32_native = (float*)ctx->workspace;
+            const uint16_t* pa_u16 = (const uint16_t*)a->data;
+            if (dgemm_fp16(m, n, k, pa_u16, b_packed_fp16.data(), y_f32_native)) {
+                if (alpha != 1.0f)
+                    for (int i = 0; i < m * n; ++i)
+                        y_f32_native[i] *= alpha;
+                if (c) {
+                    for (int i = 0; i < m; ++i)
+                        for (int j = 0; j < n; ++j) {
+                            int oy = i * n + j;
+                            y_f32_native[oy] += beta * (float)*(const float16_t*)c->broadcast_map_address(y, oy);
+                        }
+                }
+                if (post_fn)
+                    post_fn(y_f32_native, 1, m * n, m * n, fused_op, nullptr, 0);
+                convert_f32_to_f16((float16_t*)y->data, y_f32_native, (size_t)m * n);
+                return true;
+            }
+        }
 
         // Workspace layout: [A_f32 | B_f32 (if not packed) | Y_f32]
         float* ws = (float*)ctx->workspace;

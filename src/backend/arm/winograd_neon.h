@@ -8,7 +8,7 @@
 #include <arm_neon.h>
 #include <cstring>
 #include <algorithm>
-#include "winograd_transforms.h"
+#include "backend/cpu/kernel/winograd_transforms.h"
 
 namespace nnr {
 

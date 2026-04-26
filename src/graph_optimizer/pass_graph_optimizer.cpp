@@ -179,6 +179,60 @@ struct fuse_silu_pass_t : pass_t {
     bool         once()  const override { return true; }
 };
 
+struct fuse_sdpa_pass_t : pass_t {
+    bool apply(graph_optimizer_t& opt, context_t* ctx) override
+    {
+        if (!opt.fusion_enabled) return false;
+        fuse_sdpa(ctx);
+        return false;
+    }
+    const char*  name()  const override { return "fuse_sdpa"; }
+    // FUSION (not PREPROCESS): needs shape inference to have run so
+    // q_tensor->dims[...] is populated for the shape-compatibility checks.
+    pass_level_t level() const override { return pass_level_t::FUSION; }
+    bool         once()  const override { return true; }
+};
+
+// WebGPU-only: fold consecutive same-shape f32 unary elementwise ops into one
+// dispatch. Gated internally on ctx->preferred_backend == WEBGPU, so it's a
+// no-op for the CPU backend even when fusion is enabled. Kept independent of
+// opt.fusion_enabled — that flag governs the CPU-side rewrite set and is
+// often disabled for WebGPU paths (see webgpu_e2e_graph.cpp) while the
+// WebGPU-native fusion below is always desirable.
+//
+// Registered at FUSION level, not PREPROCESS: PREPROCESS only runs from
+// context_t::run()'s first_run path, not from prepare() — callers that call
+// prepare() before run() (the e2e tests do) would otherwise silently skip
+// fusion. FUSION runs via both optimize() paths and post fold_run, which
+// has the added benefit of guaranteeing all input tensor shapes are
+// propagated by the time we build the fused op.
+struct fuse_webgpu_elementwise_pass_t : pass_t {
+    bool apply(graph_optimizer_t& /*opt*/, context_t* ctx) override
+    {
+        fuse_webgpu_elementwise(ctx);
+        return false;  // chain-building is single-pass; no cascade
+    }
+    const char*  name()  const override { return "fuse_webgpu_elementwise"; }
+    pass_level_t level() const override { return pass_level_t::FUSION; }
+    bool         once()  const override { return true; }
+};
+
+// WebGPU-only: absorb a FusedElementwiseChain that directly follows a
+// MatMul into the MatMul's output epilogue. Must run AFTER
+// fuse_webgpu_elementwise has built the chain nodes (registration order
+// controls FUSION-level ordering within a round). Gated internally on
+// preferred_backend == WEBGPU.
+struct fuse_webgpu_matmul_chain_pass_t : pass_t {
+    bool apply(graph_optimizer_t& /*opt*/, context_t* ctx) override
+    {
+        fuse_webgpu_matmul_chain(ctx);
+        return false;  // single-pass; no cascade
+    }
+    const char*  name()  const override { return "fuse_webgpu_matmul_chain"; }
+    pass_level_t level() const override { return pass_level_t::FUSION; }
+    bool         once()  const override { return true; }
+};
+
 struct fold_bn_qdq_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
@@ -250,10 +304,20 @@ struct fuse_post_ops_pass_t : pass_t {
     bool         once()  const override { return false; }
 };
 
+// Layout rewrites (NCHWc blocked, NHWC) are CPU-specific: the AVX/NEON
+// kernels are packed-aware, but the WebGPU Conv/BN/Pool kernels assume
+// plain NCHW. Skip these passes when the preferred backend is WebGPU,
+// otherwise the graph gets rewritten into layouts the WebGPU ops can't
+// consume and performance collapses (measured ~35% slowdown on cnn_bench
+// before this gate landed).
+static bool skip_for_webgpu(context_t* ctx) {
+    return ctx->preferred_backend == static_cast<uint8_t>(backend_t::WEBGPU);
+}
+
 struct assign_blocked_layouts_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
-        if (!opt.fusion_enabled || opt.no_blocked) return false;
+        if (!opt.fusion_enabled || opt.no_blocked || skip_for_webgpu(ctx)) return false;
         assign_blocked_layouts(ctx);
         return false;  // idempotent; no cascade
     }
@@ -265,11 +329,54 @@ struct assign_blocked_layouts_pass_t : pass_t {
 struct assign_layouts_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
-        if (!opt.fusion_enabled || opt.no_nhwc) return false;
+        if (!opt.fusion_enabled || opt.no_nhwc || skip_for_webgpu(ctx)) return false;
         assign_layouts(ctx);
         return false;  // idempotent; no cascade
     }
     const char*  name()  const override { return "assign_layouts"; }
+    pass_level_t level() const override { return pass_level_t::LAYOUT; }
+    bool         once()  const override { return true; }
+};
+
+// T3 M1 step 1: skeleton passes for explicit Reorder ops. Both are no-ops
+// when NNR_EXPLICIT_REORDERS is OFF (the M1 default). Wired into LAYOUT
+// level after assign_*_layouts and before optimize_transposes so the
+// transpose-elimination cleanup still runs on the post-reorder graph.
+struct insert_reorders_pass_t : pass_t {
+    bool apply(graph_optimizer_t& opt, context_t* ctx) override
+    {
+        if (!opt.fusion_enabled) return false;
+        insert_reorders(ctx);
+        return false;
+    }
+    const char*  name()  const override { return "insert_reorders"; }
+    pass_level_t level() const override { return pass_level_t::LAYOUT; }
+    bool         once()  const override { return true; }
+};
+
+struct cancel_reorders_pass_t : pass_t {
+    bool apply(graph_optimizer_t& opt, context_t* ctx) override
+    {
+        if (!opt.fusion_enabled) return false;
+        cancel_reorders(ctx);
+        return false;
+    }
+    const char*  name()  const override { return "cancel_reorders"; }
+    pass_level_t level() const override { return pass_level_t::LAYOUT; }
+    bool         once()  const override { return true; }
+};
+
+// SiLU post-op fusion. Runs at LAYOUT (not FUSION) so declared_layout is
+// committed before we decide whether to bridge a Conv→Sigmoid SKIP-alias —
+// see kb/conv_silu_fusion_blocker.md.
+struct fuse_post_ops_silu_pass_t : pass_t {
+    bool apply(graph_optimizer_t& opt, context_t* ctx) override
+    {
+        if (!opt.fusion_enabled) return false;
+        fuse_post_ops_silu(ctx);
+        return false;  // idempotent; no cascade
+    }
+    const char*  name()  const override { return "fuse_post_ops_silu"; }
     pass_level_t level() const override { return pass_level_t::LAYOUT; }
     bool         once()  const override { return true; }
 };
@@ -279,7 +386,7 @@ struct assign_layouts_pass_t : pass_t {
 struct optimize_transposes_pass_t : pass_t {
     bool apply(graph_optimizer_t& opt, context_t* ctx) override
     {
-        if (!opt.fusion_enabled || opt.no_nhwc) return false;
+        if (!opt.fusion_enabled || opt.no_nhwc || skip_for_webgpu(ctx)) return false;
         optimize_transposes(ctx);
         return false;  // idempotent; no cascade
     }
@@ -346,7 +453,10 @@ struct pass_graph_optimizer_t : graph_optimizer_t {
         mgr_.add(std::make_unique<fold_constants_pass_t>());
         mgr_.add(std::make_unique<fuse_qdq_compute_pass_t>());
         mgr_.add(std::make_unique<fuse_qdq_pass_t>());
+        mgr_.add(std::make_unique<fuse_sdpa_pass_t>());
         mgr_.add(std::make_unique<fuse_post_ops_pass_t>());
+        mgr_.add(std::make_unique<fuse_webgpu_elementwise_pass_t>());
+        mgr_.add(std::make_unique<fuse_webgpu_matmul_chain_pass_t>());
 
         // LAYOUT and SCHEDULING are registered by the arch-specific subclass
         // because the blocked-layout cost model differs per arch, and order
@@ -371,7 +481,6 @@ struct pass_graph_optimizer_t : graph_optimizer_t {
                 if (!n->skip && !n->folded && n->op_type == "AveragePool")
                     n->init();
             }
-            // fuse_sdpa(ctx);  // TODO: needs non-threaded GEMM to avoid deadlock
         }
         preprocess_done = true;
     }
@@ -422,7 +531,14 @@ struct x64_pass_graph_optimizer_t final : pass_graph_optimizer_t {
         // reorder pairs left by assign_layouts.
         mgr_.add(std::make_unique<assign_blocked_layouts_pass_t>());
         mgr_.add(std::make_unique<assign_layouts_pass_t>());
+        // T3 M1: explicit Reorder ops (skeleton; no-op when flag OFF).
+        mgr_.add(std::make_unique<insert_reorders_pass_t>());
+        mgr_.add(std::make_unique<cancel_reorders_pass_t>());
         mgr_.add(std::make_unique<optimize_transposes_pass_t>());
+        // SiLU fusion runs after layout commit so we can gate on layout
+        // agreement. Must precede detect_scroll_chains so the scroll pass
+        // sees the post-fuse skip flags.
+        mgr_.add(std::make_unique<fuse_post_ops_silu_pass_t>());
 
         // SCHEDULING — scroll detection + segment pruning.
         mgr_.add(std::make_unique<detect_scroll_chains_pass_t>());
@@ -438,7 +554,11 @@ struct arm_pass_graph_optimizer_t final : pass_graph_optimizer_t {
         // cost model is here when M2.6 lands.
         mgr_.add(std::make_unique<assign_blocked_layouts_pass_t>());
         mgr_.add(std::make_unique<assign_layouts_pass_t>());
+        // T3 M1: explicit Reorder ops (skeleton; no-op when flag OFF).
+        mgr_.add(std::make_unique<insert_reorders_pass_t>());
+        mgr_.add(std::make_unique<cancel_reorders_pass_t>());
         mgr_.add(std::make_unique<optimize_transposes_pass_t>());
+        mgr_.add(std::make_unique<fuse_post_ops_silu_pass_t>());
 
         // SCHEDULING — scroll detection + segment pruning.
         mgr_.add(std::make_unique<detect_scroll_chains_pass_t>());

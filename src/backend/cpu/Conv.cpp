@@ -1,4 +1,6 @@
 #include "nnr.h"
+#include "tensor_view.h"
+#include "aligned_alloc.h"
 #include "util.h"
 #include "profiler.h"
 #include "conv_shape.h"
@@ -22,6 +24,9 @@
 #include "backend/arm/conv_direct_neon_inline.h"
 #include "backend/arm/depthwise_nhwc_neon.h"
 #include "backend/arm/depthwise_nchwc_neon.h"
+#include "backend/arm/conv_fp16_direct_neon.h"
+#include "backend/arm/conv_fp16_nhwc_direct_neon.h"
+#include "backend/arm/depthwise_fp16_neon.h"
 #ifdef NNR_USE_XBYAK_AARCH64
 #include "backend/arm/jit_gemm_driver.h"
 #endif
@@ -115,10 +120,23 @@ struct Conv_operator : public operator_t {
     // FP16 I/O: pre-converted float32 weights and bias (populated in reshape)
     float* w_f32 = nullptr;           // [M, kC, kH, kW] as float32
     float* bias_f32 = nullptr;        // [M] as float32
+#ifdef NNR_ARCH_ARM64
+    // FP16 native NCHW direct conv (has_neon_fp16): pre-packed FP16 weights
+    // in the `conv_fp16_direct_neon.h` layout.  When populated, the FP16
+    // trampoline picks the native path in preference to convert-to-FP32.
+    std::vector<uint16_t> w_fp16_direct;
+    // FP16 native NHWC direct conv: pre-packed FP16 weights in the
+    // `conv_fp16_nhwc_direct_neon.h` layout. Selected at exec time when
+    // x->format is NHWC; otherwise w_fp16_direct (NCHW) wins.
+    std::vector<uint16_t> w_fp16_nhwc_direct;
+    // FP16 native NHWC depthwise conv: repacked FP16 depthwise weights in
+    // [kH*kW, C] layout for depthwise_fp16_nhwc_neon.
+    std::vector<uint16_t> w_fp16_dw_nhwc;
+#endif
 
     ~Conv_operator() {
-        _aligned_free(w_f32);
-        _aligned_free(bias_f32);
+        nnr_aligned_free(w_f32);
+        nnr_aligned_free(bias_f32);
     }
 
     bool init() override {
@@ -415,9 +433,25 @@ struct Conv_operator : public operator_t {
         return out;
     }
 
-    // Scalar cost formula for NCHW vs NHWC comparison.
-    // BLOCKED_16 is no longer queried — assign_blocked_layouts.cpp uses
-    // structural eligibility rules instead of a cost model.
+    // NHWC channel-axis Concat alias: this Conv can write into a parent
+    // buffer with a wider LDC than its local channel count. M2 covered NHWC
+    // 1×1; M3 widens to general 2-D Conv (im2col + GEMM via dgemm_generic_ldc).
+    // group>1 still excluded — the scatter path (line ~744 in Conv_exec.h)
+    // doesn't yet honor LDC.
+    bool supports_strided_output(memory_layout_t format) const override {
+        if (format != memory_layout_t::NHWC) return false;
+        if (outputs.empty() || !outputs[0]) return false;
+        if (outputs[0]->type != NNR_DATA_TYPE_FLOAT32) return false;
+        if (group != 1) return false;
+        if (kernels.size() != 2) return false;
+        return true;
+    }
+
+    // Scalar cost formula for NCHW / NHWC / BLOCKED layout comparison.
+    // BLOCKED uses the same structural model as NCHW (channel-major outer
+    // layout, spatial inner) but replaces NCHW's stride-W cache-line waste
+    // with c-block packing — every channel-block load is one SIMD register.
+    // Eligible chains have C aligned to NATIVE_BLOCK so block_simd_util=1.0.
     float layout_cost(memory_layout_t layout, bool input_nhwc) const override {
         if (inputs.size() < 2 || !inputs[1]) return 0;
         auto* x = inputs[0];
@@ -432,10 +466,43 @@ struct Conv_operator : public operator_t {
         int K = kH * kW * kC;
         int spatial = oH * oW;
         bool nhwc = (layout == memory_layout_t::NHWC);
+        bool blocked = (layout == memory_layout_t::BLOCKED_16 ||
+                        layout == memory_layout_t::BLOCKED_8);
 
         float input_bytes  = (float)C * H * W * 4;
         float weight_bytes = (float)M * K * 4;
         float output_bytes = (float)M * oH * oW * 4;
+
+        if (blocked) {
+            int block = (layout == memory_layout_t::BLOCKED_16) ? 16 : 8;
+            float bu = block_simd_util(C, block);
+            // DW NCHWc has the same per-op cost as DW NCHW
+            // (see assign_blocked_layouts.cpp:253). bu doesn't apply: DW
+            // kernels are per-channel and don't pack channels into SIMD lanes.
+            if (groups == C) {
+                float dw_bytes = input_bytes + output_bytes + (float)C * kH * kW * 4;
+                return dw_bytes * 1.1f;
+            }
+            // 1×1: c-block-packed GEMM (channels are GEMM K).
+            if (kH == 1 && kW == 1) {
+                return weight_bytes + input_bytes / bu + output_bytes;
+            }
+            // 3×3 stride-1 dilation-1: NCHWc Winograd path (no im2col).
+            bool wino = false;
+            if (kH == 3 && kW == 3 && groups == 1) {
+                bool s1 = strides.empty() || (strides.size() >= 2 && strides[0] == 1 && strides[1] == 1);
+                bool d1 = dilations.empty() || (dilations.size() >= 2 && dilations[0] == 1 && dilations[1] == 1);
+                int num_tiles = ((oH + 3) / 4) * ((oW + 3) / 4);
+                wino = s1 && d1 && num_tiles >= WINOGRAD_MIN_TILES;
+            }
+            if (wino) return input_bytes / bu + output_bytes + weight_bytes;
+            // General: c-block im2col + packed GEMM. Same im2col bandwidth
+            // as NCHW but the spatial reads avoid the stride-W cache-line waste.
+            float im2col_bytes = (float)K * spatial * 4 * groups;
+            float im2col_eff = input_bytes / bu + im2col_bytes;
+            float gemm_eff = weight_bytes + im2col_bytes + output_bytes;
+            return im2col_eff + gemm_eff;
+        }
 
         if (groups == C) {
             float dw_bytes = input_bytes + output_bytes + (float)C * kH * kW * 4;
@@ -481,6 +548,45 @@ struct Conv_operator : public operator_t {
         if (!inputs[0] || !inputs[1]) return {};
         if (inputs[0]->ndim != 4) return {};
         if (inputs[0]->type != NNR_DATA_TYPE_FLOAT32) return {};
+#ifdef NNR_EXPLICIT_REORDERS
+        // T3 follow-up A: exec_strip handles three layout combos:
+        //   - NCHW/NCHW (whole-tensor uniform)
+        //   - BLOCKED/BLOCKED (DW/1×1/Wino/general NCHWc strip kernels)
+        //   - NCHW/BLOCKED (general K×K boundary Conv with on-entry strip
+        //     reorder of input — covers residual-path 1×1 s=2 downsample
+        //     whose input tensor is shared with a NCHW-uniform main-path
+        //     Conv and never gets an upstream Reorder)
+        // BLOCKED/NCHW (terminal exit) and grouped non-DW + dilated Convs
+        // opt out — kernels are whole-tensor only.
+        {
+            const auto in_lo  = inputs[0]->declared_layout;
+            const auto out_lo = outputs[0] ? outputs[0]->declared_layout : in_lo;
+            const bool is_depthwise = (group == (int)inputs[0]->dims[1]
+                                       && inputs[1]->dims[1] == 1);
+            const bool nchw_uniform    = (in_lo == memory_layout_t::NCHW
+                                          && out_lo == memory_layout_t::NCHW);
+            const bool blocked_uniform = (in_lo == NATIVE_BLOCKED_FMT
+                                          && out_lo == NATIVE_BLOCKED_FMT
+                                          && NATIVE_BLOCKED_FMT != memory_layout_t::NCHW);
+            // NCHW→BLOCKED: only the general K×K NCHWc strip path covers it
+            // (1×1 s=1 fast path requires BLOCKED-in; DW requires BLOCKED-in).
+            // Restrict to the general path's shape envelope so exec_strip
+            // never bails mid-strip on this combo.
+            const bool mixed_to_blocked = (in_lo == memory_layout_t::NCHW
+                                           && out_lo == NATIVE_BLOCKED_FMT
+                                           && NATIVE_BLOCKED_FMT != memory_layout_t::NCHW
+                                           && group == 1
+                                           && (int)inputs[0]->dims[1] % NATIVE_BLOCK == 0
+                                           && (int)inputs[1]->dims[0] % NATIVE_BLOCK == 0);
+            if (!nchw_uniform && !blocked_uniform && !mixed_to_blocked) return {};
+            if (blocked_uniform || mixed_to_blocked) {
+                if (!is_depthwise && group != 1) return {};
+                if (!dilations.empty()
+                    && (dilations[0] != 1 || dilations[1] != 1))
+                    return {};
+            }
+        }
+#endif
         // Skip grouped Conv (except depthwise)
         int iC = inputs[0]->dims[1];
         int kC = inputs[1]->dims[1];

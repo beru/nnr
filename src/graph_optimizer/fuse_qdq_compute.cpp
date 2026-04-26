@@ -29,6 +29,31 @@ void fuse_qdq_compute(context_t* ctx)
     const int n = static_cast<int>(nodes.size());
     const auto backend = static_cast<backend_t>(ctx->preferred_backend);
     int default_opset = 13;
+
+    // Return either `fused` (if its init+reshape succeeded) or a freshly-built
+    // CPU equivalent. Used after the fused op is constructed and its inputs/
+    // outputs wired up — when the chosen backend's QLinear op rejects a
+    // shape/dtype combo, init/reshape returns false and any backend-specific
+    // state (GPU buffers, pipelines) is never set up. Demote to CPU so runtime
+    // exec doesn't dereference null. Returns nullptr only if even CPU fails.
+    auto demote_if_needed = [&](operator_t* fused) -> operator_t* {
+        if (fused->init() && fused->reshape()) return fused;
+        if (fused->resolved_backend == static_cast<uint8_t>(backend_t::CPU))
+            return nullptr;
+        operator_t* cpu_f = solve_operator(fused->op_type, fused->opset,
+                                           ctx->attr_pool, backend_t::CPU);
+        if (!cpu_f) return nullptr;
+        cpu_f->ctx       = ctx;
+        cpu_f->opset     = fused->opset;
+        cpu_f->op_type   = fused->op_type;
+        cpu_f->node_name = fused->node_name;
+        cpu_f->domain    = fused->domain;
+        cpu_f->inputs    = fused->inputs;
+        cpu_f->outputs   = fused->outputs;
+        cpu_f->attrs     = fused->attrs;
+        if (cpu_f->init() && cpu_f->reshape()) return cpu_f;
+        return nullptr;
+    };
     for (auto& [domain, version] : ctx->meta_opsets) {
         if (domain == "ai.onnx" || domain.empty()) {
             default_opset = std::max(default_opset, (int)version); break;
@@ -190,11 +215,11 @@ void fuse_qdq_compute(context_t* ctx)
         tensor_t* w_zp_tensor = is_conv ? fused->inputs[5] : fused->inputs[5];
         convert_weight_uint8_to_int8(w_tensor, w_zp_tensor);
 
-        fused->init();
-        fused->reshape();
+        operator_t* placed = demote_if_needed(fused);
+        if (!placed) continue;
 
         // Replace the Conv/MatMul node, mark source DQ/Q as folded
-        nodes[i] = fused;
+        nodes[i] = placed;
         // Only fold activation DQ if no other active consumers remain
         // (fused node bypasses dq_x, so check after replacement)
         if (count_consumers(dq_x->outputs[0], all_producer[op->inputs[0]]) == 0)
@@ -328,11 +353,11 @@ void fuse_qdq_compute(context_t* ctx)
         outs[0] = q_y->outputs[0];
         fused->outputs = {outs, 1};
 
-        fused->init();
-        fused->reshape();
+        operator_t* placed = demote_if_needed(fused);
+        if (!placed) continue;
 
         // Replace Add node, fold source DQ/Q/Relu
-        nodes[i] = fused;
+        nodes[i] = placed;
         if (count_consumers(dq_a->outputs[0], all_producer[op->inputs[0]]) == 0)
             dq_a->folded = true;
         if (count_consumers(dq_b->outputs[0], all_producer[op->inputs[1]]) == 0)

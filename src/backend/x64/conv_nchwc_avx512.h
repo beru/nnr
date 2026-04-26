@@ -74,7 +74,8 @@ inline void conv1x1_nchwc_avx512(
     const float* __restrict weight,
     const float* __restrict bias,
     int N, int IC, int OC, int H, int W,
-    void (*post_fn)(float*, int) = nullptr)
+    void (*post_fn)(float*, int) = nullptr,
+    int strip_row_start = -1, int strip_row_end = -1)
 {
     constexpr int W_TILE = 14;
 
@@ -84,13 +85,19 @@ inline void conv1x1_nchwc_avx512(
     const size_t in_batch  = (size_t)ICb * HW * 16;
     const size_t out_batch = (size_t)OCb * HW * 16;
 
-    const int total_work = N * OCb * H;
+    // Strip range over output rows. Defaults to the full image height.
+    const int h_start = (strip_row_start >= 0) ? strip_row_start : 0;
+    const int h_end   = (strip_row_end   >= 0) ? strip_row_end   : H;
+    const int strip_h = h_end - h_start;
+    if (strip_h <= 0) return;
+
+    const int total_work = N * OCb * strip_h;
 
     nnr::for_dynamic(0, total_work, nnr::compute_threads(total_work), [&](int /*tid*/, int work_idx) {
-        const int n  = work_idx / (OCb * H);
-        const int rem = work_idx % (OCb * H);
-        const int ob = rem / H;
-        const int h  = rem % H;
+        const int n  = work_idx / (OCb * strip_h);
+        const int rem = work_idx % (OCb * strip_h);
+        const int ob = rem / strip_h;
+        const int h  = h_start + (rem % strip_h);
 
         const float* in_n  = input  + n * in_batch;
         float*       out_n = output + n * out_batch;
@@ -217,8 +224,17 @@ inline void conv_nchwc_avx512(
     int KH, int KW,
     int strideH, int strideW,
     int padH, int padW,
-    void (*post_fn)(float*, int) = nullptr)
+    void (*post_fn)(float*, int) = nullptr,
+    int strip_row_start = -1, int strip_row_end = -1)
 {
+    // Strip range over output rows; defaults to full tensor.
+    // Each `oh` is row-local: it reads input rows [oh*strideH-padH ..
+    // oh*strideH+KH-1-padH] and writes only out_row(oh). Narrowing oh's
+    // range is therefore enough — no kernel-internal changes needed.
+    const int oh_start = (strip_row_start >= 0) ? strip_row_start : 0;
+    const int oh_end   = (strip_row_end   >= 0) ? strip_row_end   : OH;
+    const int strip_h  = oh_end - oh_start;
+    if (strip_h <= 0) return;
     constexpr int S_TILE = 6;   // spatial tile for 4x6 JIT
     constexpr int FC = 4;       // max FilterCount
     constexpr int W_TILE = 14;  // spatial tile for intrinsics fallback
@@ -276,14 +292,14 @@ inline void conv_nchwc_avx512(
     }
 #endif
 
-    const int total_work = N * OCg * OH;
+    const int total_work = N * OCg * strip_h;
 
     nnr::for_dynamic(0, total_work, nnr::compute_threads(total_work),
         [&](int /*tid*/, int work_idx) {
-        const int n   = work_idx / (OCg * OH);
-        const int rem2 = work_idx % (OCg * OH);
-        const int og  = rem2 / OH;
-        const int oh  = rem2 % OH;
+        const int n   = work_idx / (OCg * strip_h);
+        const int rem2 = work_idx % (OCg * strip_h);
+        const int og  = rem2 / strip_h;
+        const int oh  = oh_start + (rem2 % strip_h);
 
         const int ob_start = og * FC;
         const int F = std::min(FC, OCb - ob_start);

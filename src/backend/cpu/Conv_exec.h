@@ -280,7 +280,7 @@
                             const int total = oN * OCb * oH * oW * block;
                             post_fn(out_nchwc_w, 1, total, total, fused_op, nullptr, 0);
                         }
-                        y->format = NATIVE_BLOCKED_FMT;
+                        y->format = y->declared_layout;
                         return true;
                     }
 
@@ -365,14 +365,11 @@
                         post_fn(out_nchwc, 1, total, total, fused_op, nullptr, 0);
                     }
 
-                    if (y_is_blocked) {
-                        y->format = NATIVE_BLOCKED_FMT;
-                    } else {
-                        // Transpose blocked-padded output → NCHW; nchwc_to_nchw
-                        // honors M (logical OC) and drops the OCb*block tail.
+                    if (!y_is_blocked) {
+                        // Terminal Conv: transpose blocked-padded output → NCHW.
                         nchwc_to_nchw((float*)y->data, out_nchwc, oN, M, oH, oW, block);
-                        y->format = memory_layout_t::NCHW;
                     }
+                    y->format = y->declared_layout;
                     return true;
                 }
             }
@@ -425,7 +422,7 @@
                         post_fn(out_nchwc, 1, total, total, fused_op, nullptr, 0);
                     }
 
-                    y->format = NATIVE_BLOCKED_FMT;
+                    y->format = y->declared_layout;
                     return true;
                 }
             }
@@ -463,13 +460,24 @@
             // NHWC 1×1 Conv path: used when layout pass assigns NHWC format
             if constexpr (std::is_same_v<T, float>) {
                 if (!w_nhwc.empty() && y->format == memory_layout_t::NHWC) {
-                    // Lazy pack: only pack when NHWC path is actually entered
-                    if (w_packed.empty() && M >= 64) {
+                    // Strided dst (NHWC channel-axis Concat alias): output's
+                    // per-spatial-position C stride equals the Concat parent's
+                    // full C count, not this Conv's local M. The AVX-512 path
+                    // (`dgemm_packed_supports_ldc()`) honors ldc directly via
+                    // packed-B; AVX-2 / NEON fall back to dgemm_generic_ldc.
+                    const auto Y = make_addr(y);
+                    const int ldc = Y.elem_stride<float>(3);
+                    const bool strided = (ldc != M);
+                    const bool simd_ldc = dgemm_packed_supports_ldc();
+                    // Lazy pack: only pack when NHWC path is actually entered.
+                    // When strided AND no SIMD LDC: skip pack (we'll use
+                    // dgemm_generic_ldc with unpacked B).
+                    if ((!strided || simd_ldc) && w_packed.empty() && M >= 64) {
                         w_packed.resize(pack_b_size(iC, M));
                         pack_b(w_packed.data(), w_nhwc.data(), iC, M);
                     }
                     for (int n = 0; n < oN; ++n) {
-                        float* Y_n = yd + (size_t)n * M * spatial;
+                        float* Y_n = Y.at<float>(n, 0, 0, 0);
                         const float* X_n;
                         if (x->format == memory_layout_t::NHWC) {
                             X_n = xd + (size_t)n * spatial * iC;
@@ -480,28 +488,23 @@
                             nchw_to_nhwc(ws, X_nchw, 1, iC, 1, spatial);
                             X_n = ws;
                         }
-                        int y_off = (int)((size_t)n * M * spatial);
-                        if (!w_packed.empty()) {
-                            gemm_post_nhwc_t nhwc_post;
-                            nhwc_post.bias = (const float*)bias;
-                            nhwc_post.c_base = Y_n;
-                            nhwc_post.c_base_offset = y_off;
-                            nhwc_post.post_fn = post_fn;
-                            nhwc_post.fused_op = fused_op;
-                            nhwc_post.classify();
-                            dgemm_nhwc(spatial, M, iC, X_n, w_packed.data(), Y_n, nhwc_post);
+                        int y_off = (int)((size_t)n * (size_t)spatial * ldc);
+                        gemm_post_nhwc_t nhwc_post;
+                        nhwc_post.bias = (const float*)bias;
+                        nhwc_post.c_base = Y_n;
+                        nhwc_post.c_base_offset = y_off;
+                        nhwc_post.post_fn = post_fn;
+                        nhwc_post.fused_op = fused_op;
+                        nhwc_post.classify();
+                        if (!w_packed.empty() && (!strided || simd_ldc)) {
+                            dgemm_nhwc(spatial, M, iC, X_n, w_packed.data(), Y_n,
+                                       nhwc_post, strided ? ldc : 0);
                         } else {
-                            gemm_post_nhwc_t nhwc_post2;
-                            nhwc_post2.bias = (const float*)bias;
-                            nhwc_post2.c_base = Y_n;
-                            nhwc_post2.c_base_offset = y_off;
-                            nhwc_post2.post_fn = post_fn;
-                            nhwc_post2.fused_op = fused_op;
-                            nhwc_post2.classify();
-                            dgemm_generic(spatial, M, iC, X_n, w_nhwc.data(), Y_n, nhwc_post2);
+                            dgemm_generic_ldc(spatial, M, iC, X_n, w_nhwc.data(),
+                                              Y_n, ldc, nhwc_post);
                         }
                     }
-                    y->format = memory_layout_t::NHWC;
+                    y->format = y->declared_layout;
                     return true;
                 }
             }
@@ -624,12 +627,23 @@
                         const float* wpb = w_winograd_packed_nhwc.empty() ? nullptr : w_winograd_packed_nhwc.data();
                         winograd_conv2d_nhwc(yd, xd, w_winograd_nhwc.data(), wpb, bias,
                             oN, iC, iH, iW, M, oH, oW, pH, pW, ws, input_nhwc, wino_group, post_fn, fused_op);
-                        y->format = memory_layout_t::NHWC;
+                        y->format = y->declared_layout;
                         return true;
                     }
 #endif
-                    // Lazy pack: only pack when NHWC path is actually entered
-                    if (w_packed.empty() && MM >= 64) {
+                    // Strided dst (NHWC channel-axis Concat alias): output's
+                    // per-spatial-position C stride equals the parent's full C
+                    // count, not this Conv's local M. AVX-512 path
+                    // (`dgemm_packed_supports_ldc()`) honors ldc directly via
+                    // packed-B; AVX-2 / NEON fall back to dgemm_generic_ldc.
+                    const auto Y = make_addr(y);
+                    const int ldc = (group == 1) ? Y.elem_stride<float>(3) : M;
+                    const bool strided = (ldc != M);
+                    const bool simd_ldc = dgemm_packed_supports_ldc();
+                    // Lazy pack: only pack when NHWC path is actually entered.
+                    // When strided AND no SIMD LDC support: skip pack since the
+                    // dgemm_generic_ldc fallback uses the unpacked weights.
+                    if ((!strided || simd_ldc) && w_packed.empty() && MM >= 64) {
                         size_t psz = pack_b_size(K, MM);
                         w_packed.resize(psz * group);
                         for (int g = 0; g < group; g++)
@@ -637,8 +651,9 @@
                                 w_gemm_nhwc.data() + (size_t)g * K * MM, K, MM);
                     }
 #ifdef NNR_USE_XBYAK_AARCH64
-                    // JIT 6×16 packed weights: pack on first entry (group==1 only)
-                    if (w_packed_jit.empty() && group == 1 && MM >= 16) {
+                    // JIT 6×16 packed weights: pack on first entry (group==1 only).
+                    // Skip on strided dst — JIT path assumes contiguous output.
+                    if (!strided && w_packed_jit.empty() && group == 1 && MM >= 16) {
                         w_packed_jit.resize(neon_jit::pack_b_jit_size(K, MM));
                         neon_jit::pack_b_jit(w_packed_jit.data(),
                             w_gemm_nhwc.data(), K, MM);
@@ -664,25 +679,25 @@
                         }
 
                         if (group == 1 && nhwc_tile_h < oH) {
-                            // Tiled NHWC: NHWC output is [spatial × M], contiguous in spatial
-                            float* yn = yd + (size_t)n * spatial * M;
+                            // Tiled NHWC: NHWC output is [spatial × ldc], contiguous in spatial
+                            float* yn = Y.at<float>(n, 0, 0, 0);
                             for (int oh0 = 0; oh0 < oH; oh0 += nhwc_tile_h) {
                                 int th = std::min(nhwc_tile_h, oH - oh0);
                                 int tile_sp = th * oW;
                                 im2col_nhwc_tiled(col, xn_nhwc, iC, kC, iH, iW, kH, kW, oW,
                                     sH, sW, pH, pW, dH, dW, 0, oh0, th);
-                                float* yn_tile = yn + (size_t)oh0 * oW * M;
+                                float* yn_tile = Y.at<float>(n, 0, oh0, 0);
                                 gemm_post_nhwc_t nhwc_post;
                                 nhwc_post.bias = (const float*)bias;
                                 nhwc_post.c_base = yn_tile;
-                                nhwc_post.c_base_offset = (int)((size_t)n * spatial * M + oh0 * oW * M);
+                                nhwc_post.c_base_offset = (int)((size_t)n * spatial * ldc + (size_t)oh0 * oW * ldc);
                                 nhwc_post.post_fn = post_fn;
                                 nhwc_post.fused_op = fused_op;
                                 nhwc_post.classify();
 #ifdef NNR_USE_XBYAK_AARCH64
                                 // JIT 6×16 path: profitable for large GEMMs where
                                 // the bigger tile outweighs unfused post-op overhead.
-                                if (!w_packed_jit.empty()
+                                if (!strided && !w_packed_jit.empty()
                                     && (int64_t)tile_sp * MM * K > (1 << 22)) {
                                     neon_jit::dgemm_jit(tile_sp, MM, K,
                                         col, K, w_packed_jit.data(),
@@ -692,10 +707,12 @@
                                         nhwc_post.apply(0, yn_tile + s * MM, MM);
                                 } else
 #endif
-                                if (!w_packed.empty())
-                                    dgemm_nhwc(tile_sp, MM, K, col, w_packed.data(), yn_tile, nhwc_post);
+                                if (!w_packed.empty() && (!strided || simd_ldc))
+                                    dgemm_nhwc(tile_sp, MM, K, col, w_packed.data(),
+                                               yn_tile, nhwc_post, strided ? ldc : 0);
                                 else
-                                    dgemm_generic(tile_sp, MM, K, col, w_gemm_nhwc.data(), yn_tile, nhwc_post);
+                                    dgemm_generic_ldc(tile_sp, MM, K, col,
+                                                      w_gemm_nhwc.data(), yn_tile, ldc, nhwc_post);
                             }
                         } else {
                             // Non-tiled path (small buffer or groups > 1)
@@ -705,25 +722,20 @@
 
                                 // GEMM: col[spatial x K] x W[K x MM] -> out[spatial x MM]
                                 if (group == 1) {
-                                    float* yn = yd + (size_t)n * spatial * M;
-                                    if (!w_packed.empty()) {
-                                        gemm_post_nhwc_t nhwc_post;
-                                        nhwc_post.bias = (const float*)bias;
-                                        nhwc_post.c_base = yn;
-                                        nhwc_post.c_base_offset = (int)((size_t)n * spatial * M);
-                                        nhwc_post.post_fn = post_fn;
-                                        nhwc_post.fused_op = fused_op;
-                                        nhwc_post.classify();
-                                        dgemm_nhwc(spatial, MM, K, col, w_packed.data(), yn, nhwc_post);
+                                    float* yn = Y.at<float>(n, 0, 0, 0);
+                                    gemm_post_nhwc_t nhwc_post;
+                                    nhwc_post.bias = (const float*)bias;
+                                    nhwc_post.c_base = yn;
+                                    nhwc_post.c_base_offset = (int)((size_t)n * spatial * ldc);
+                                    nhwc_post.post_fn = post_fn;
+                                    nhwc_post.fused_op = fused_op;
+                                    nhwc_post.classify();
+                                    if (!w_packed.empty() && (!strided || simd_ldc)) {
+                                        dgemm_nhwc(spatial, MM, K, col, w_packed.data(),
+                                                   yn, nhwc_post, strided ? ldc : 0);
                                     } else {
-                                        gemm_post_nhwc_t nhwc_post;
-                                        nhwc_post.bias = (const float*)bias;
-                                        nhwc_post.c_base = yn;
-                                        nhwc_post.c_base_offset = (int)((size_t)n * spatial * M);
-                                        nhwc_post.post_fn = post_fn;
-                                        nhwc_post.fused_op = fused_op;
-                                        nhwc_post.classify();
-                                        dgemm_generic(spatial, MM, K, col, w_gemm_nhwc.data(), yn, nhwc_post);
+                                        dgemm_generic_ldc(spatial, MM, K, col,
+                                                          w_gemm_nhwc.data(), yn, ldc, nhwc_post);
                                     }
                                 } else {
                                     // Groups > 1: GEMM into temp, then scatter to interleaved output
@@ -749,7 +761,7 @@
                     if (group != 1 && post_fn)
                         post_fn(yd, 1, (int)((size_t)oN * spatial * M), (int)((size_t)oN * spatial * M), fused_op, nullptr, 0);
 
-                    y->format = memory_layout_t::NHWC;
+                    y->format = y->declared_layout;
                     return true;
                 }
             }

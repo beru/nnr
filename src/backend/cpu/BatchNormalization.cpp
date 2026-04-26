@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "tensor_view.h"
 #include "util.h"
 #include "thread_pool.h"
 #include "cpu_features.h"
@@ -28,7 +29,15 @@ struct BatchNormalization_operator : public operator_t {
     }
 
     bool reshape() override {
-        if (!outputs[0]->reshape_identity(inputs[0]))
+        // Preserve a quantized output type set by the BN→Q fold
+        // (fold_bn_qdq.cpp re-types y to UINT8/INT8 and rewrites scale/bias
+        // into combined A[c]/B[c]). reshape_identity() with the default
+        // type would clobber it back to the fp32 input type; downstream
+        // QLinearMul/QLinearAdd would then see fp32 and bail.
+        const data_type_t y_type = outputs[0]->type;
+        const bool fold_typed = (y_type == NNR_DATA_TYPE_UINT8 || y_type == NNR_DATA_TYPE_INT8);
+        const data_type_t out_type = fold_typed ? y_type : inputs[0]->type;
+        if (!outputs[0]->reshape_identity(inputs[0], out_type))
             return false;
         // NHWC support for 4D inputs in inference mode.
         // uint8 is the fused DQ→BN→Q path (scale/bias already rewritten to
@@ -50,6 +59,17 @@ struct BatchNormalization_operator : public operator_t {
             }
         }
         return true;
+    }
+
+    bool supports_strided_output(memory_layout_t format) const override {
+        if (format != memory_layout_t::NHWC) return false;
+        if (training_mode) return false;
+        if (outputs.empty() || !outputs[0]) return false;
+        if (outputs[0]->ndim != 4) return false;
+        // M5 wired LDC into the fp32 NHWC inference path only. uint8
+        // (fold_bn_qdq fast path) and fp32→uint8 paths still write contiguous
+        // — opt them in when the kernels learn LDC.
+        return outputs[0]->type == NNR_DATA_TYPE_FLOAT32;
     }
 
     template <typename T>
@@ -136,23 +156,26 @@ struct BatchNormalization_operator : public operator_t {
                 ch_beta[c]  = (float)pb[c] - a * (float)pmean[c];
             }
             if (y->format == memory_layout_t::NHWC && x->ndim == 4) {
-                // NHWC: data is [N, H, W, C], channel is innermost
-                int spatial = N * channel; // N * H * W
+                // NHWC: data is [N, H, W, C], channel is innermost.
+                // Strided dst (Concat alias): output's spatial-major stride is
+                // ldc = parent C count, not local C.
+                const int spatial = N * channel; // N * H * W
+                const int ldc = make_addr(y).elem_stride<T>(3);
                 if constexpr (std::is_same_v<T, float>) {
 #ifdef NNR_ARCH_X64
                     for (int s = 0; s < spatial; ++s)
-                        channel_affine_avx512((float*)py + s * C,
-                            (const float*)px + s * C, ch_alpha, ch_beta, C);
+                        channel_affine_avx512((float*)py + (size_t)s * ldc,
+                            (const float*)px + (size_t)s * C, ch_alpha, ch_beta, C);
 #elifdef NNR_ARCH_ARM64
                     {
                         for (int s = 0; s < spatial; ++s)
-                            neon::affine_channel((const float*)px + s * C, (float*)py + s * C, ch_alpha, ch_beta, C);
+                            neon::affine_channel((const float*)px + (size_t)s * C, (float*)py + (size_t)s * ldc, ch_alpha, ch_beta, C);
                     }
 #else
                     {
                         for (int s = 0; s < spatial; ++s) {
-                            const float* src = (const float*)px + s * C;
-                            float* dst = (float*)py + s * C;
+                            const float* src = (const float*)px + (size_t)s * C;
+                            float* dst = (float*)py + (size_t)s * ldc;
                             for (int c = 0; c < C; ++c)
                                 dst[c] = ch_alpha[c] * src[c] + ch_beta[c];
                         }
@@ -160,13 +183,21 @@ struct BatchNormalization_operator : public operator_t {
 #endif
                 } else {
                     for (int s = 0; s < spatial; ++s) {
-                        const T* src = px + s * C;
-                        T* dst = py + s * C;
+                        const T* src = px + (size_t)s * C;
+                        T* dst = py + (size_t)s * ldc;
                         for (int c = 0; c < C; ++c)
                             dst[c] = (T)(ch_alpha[c] * (float)src[c] + ch_beta[c]);
                     }
                 }
             } else {
+                // Single-pass BN+Relu fusion: when post_fn is a leaf Relu,
+                // fold max(0, ...) into the affine kernel. Saves one sweep
+                // over dst.
+                const bool fuse_relu = post_fn != nullptr
+                    && fused_op != nullptr
+                    && fused_op->op_type == "Relu"
+                    && fused_op->post_fn == nullptr
+                    && std::is_same_v<T, float>;
                 nnr::for_cost(0, NC, channel, [&](int j) {
                     int o = j * channel;
                     int jc = j % C;
@@ -175,16 +206,31 @@ struct BatchNormalization_operator : public operator_t {
                     T* dst = py + o;
 #ifdef NNR_ARCH_X64
                     if constexpr (std::is_same_v<T, float>) {
-                        affine_avx512((float*)dst, (const float*)src, channel, a, b);
+                        if (fuse_relu)
+                            affine_relu_avx512((float*)dst, (const float*)src, channel, a, b);
+                        else
+                            affine_avx512((float*)dst, (const float*)src, channel, a, b);
                     } else
 #elifdef NNR_ARCH_ARM64
                     if constexpr (std::is_same_v<T, float>) {
                         neon::affine_broadcast(src, dst, channel, a, b);
+                        if (fuse_relu) {
+                            float* fdst = (float*)dst;
+                            for (int i = 0; i < channel; ++i)
+                                if (fdst[i] < 0.0f) fdst[i] = 0.0f;
+                        }
                     } else
 #endif
-                    for (int i = 0; i < channel; ++i)
-                        dst[i] = (T)(a * (float)src[i] + b);
+                    for (int i = 0; i < channel; ++i) {
+                        float v = a * (float)src[i] + b;
+                        if (fuse_relu && v < 0.0f) v = 0.0f;
+                        dst[i] = (T)v;
+                    }
                 });
+                if (post_fn && !fuse_relu) {
+                    post_fn((float*)py, NC, channel, channel,
+                            fused_op, nullptr, 0);
+                }
             }
         }
         return true;

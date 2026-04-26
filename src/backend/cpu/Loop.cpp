@@ -24,7 +24,101 @@ struct Loop_operator : public operator_t {
         return true;
     }
 
-    bool reshape() override { return true; }
+    bool reshape() override {
+        if (!body) return false;
+        int num_carried = (int)inputs.size() - 2;
+        int num_scan = (int)body_output_names.size() - 1 - num_carried;
+        if (num_scan < 0) num_scan = 0;
+
+        // Seed body inputs (iter=0, cond=true, carried=initial state) so the
+        // body can run a shape-propagation pass. Use real data, not just
+        // shape, since cheap shape-driven ops inside the body (Shape, Gather,
+        // Slice, Concat, Cast) feed sizes into Reshape/Resize and need values.
+        small_vector<int> scalar_dims;
+        if (body_input_names.size() > 0) {
+            tensor_t* t = ctx->search_tensor(body_input_names[0]);
+            if (t && t->reshape(scalar_dims, NNR_DATA_TYPE_INT64) && t->data)
+                *(int64_t*)t->data = 0;
+        }
+        if (body_input_names.size() > 1) {
+            tensor_t* t = ctx->search_tensor(body_input_names[1]);
+            if (t && t->reshape(scalar_dims, NNR_DATA_TYPE_BOOL) && t->data)
+                *(bool*)t->data = true;
+        }
+        for (int i = 0; i < num_carried; ++i) {
+            if (body_input_names.size() <= (size_t)(i + 2)) break;
+            const tensor_t* src = inputs[i + 2];
+            if (!src) continue;
+            tensor_t* t = ctx->search_tensor(body_input_names[i + 2]);
+            if (!t) continue;
+            if (src->data) t->apply(*src);
+            else t->reshape_identity(src);
+        }
+
+        // Body shape propagation: mirrors fold_run for the subgraph. Reshape
+        // every node and best-effort exec the cheap ones so shape-driven data
+        // (Shape→Slice→Cast→Concat producing Reshape/Resize sizes) is valid
+        // by the time downstream ops reshape. Expensive/control-flow/random
+        // ops are skipped — their reshape alone is enough for shape inference.
+        auto is_unsafe = [](std::string_view op) {
+            return op == "RandomNormal"     || op == "RandomNormalLike" ||
+                   op == "RandomUniform"    || op == "RandomUniformLike" ||
+                   op == "Multinomial"      || op == "Bernoulli";
+        };
+        auto is_expensive = [](std::string_view op) {
+            return op == "Conv"        || op == "ConvTranspose"  ||
+                   op == "MatMul"      || op == "Gemm"           ||
+                   op == "ConvInteger" || op == "MatMulInteger"  ||
+                   op == "QLinearConv" || op == "QLinearMatMul"  ||
+                   op == "LSTM"        || op == "GRU"            || op == "RNN" ||
+                   op == "Loop"        || op == "If"             || op == "Scan" ||
+                   op == "NonMaxSuppression" || op == "TopK"     || op == "RoiAlign";
+        };
+        for (auto* n : body->nodes) {
+            if (!n->reshape()) continue;
+            if (is_unsafe(n->op_type) || is_expensive(n->op_type)) continue;
+            bool has_null = false;
+            for (auto* t : n->inputs)
+                if (t && (!t->data || t->type == NNR_DATA_TYPE_UNDEFINED)) { has_null = true; break; }
+            for (auto* t : n->outputs)
+                if (t && !t->data && t->type != NNR_DATA_TYPE_UNDEFINED) { has_null = true; break; }
+            if (!has_null) n->exec();
+        }
+
+        // Carried final outputs inherit body output shapes.
+        for (int i = 0; i < num_carried && i < (int)outputs.size(); ++i) {
+            size_t out_idx = (size_t)(1 + i);
+            if (body_output_names.size() <= out_idx) break;
+            const tensor_t* src = ctx->search_tensor(body_output_names[out_idx]);
+            if (src && outputs[i] && src->type != NNR_DATA_TYPE_UNDEFINED)
+                outputs[i]->reshape_identity(src);
+        }
+
+        // Scan outputs prepend an iteration-count dim. If M (trip count) is a
+        // static initializer we use it; otherwise default to 1 — the typical
+        // batched case (e.g. ssd_mobilenet's cond-driven loop with batch=1).
+        // Downstream Shape→Gather→Reshape chains read dim[0] through the
+        // backbone, so 0 would zero-out feature maps and break Concat alignment.
+        // exec() rewrites the real shape once iteration count is known.
+        int placeholder_iters = 1;
+        if (inputs[0] && inputs[0]->ndata > 0 && inputs[0]->data) {
+            int64_t m = *(const int64_t*)inputs[0]->data;
+            if (m > 0 && m < INT_MAX) placeholder_iters = (int)m;
+        }
+        for (int i = 0; i < num_scan && (num_carried + i) < (int)outputs.size(); ++i) {
+            size_t out_idx = (size_t)(1 + num_carried + i);
+            if (body_output_names.size() <= out_idx) break;
+            const tensor_t* src = ctx->search_tensor(body_output_names[out_idx]);
+            if (!src || src->type == NNR_DATA_TYPE_UNDEFINED) continue;
+            tensor_t* dst = outputs[num_carried + i];
+            if (!dst) continue;
+            small_vector<int> dims(src->ndim + 1);
+            dims[0] = placeholder_iters;
+            for (int d = 0; d < src->ndim; ++d) dims[d + 1] = src->dims[d];
+            dst->reshape(dims, src->type);
+        }
+        return true;
+    }
 
     bool exec() override {
         int64_t max_trip = INT64_MAX;
@@ -85,14 +179,23 @@ struct Loop_operator : public operator_t {
             for (int i = 0; i < num_carried; ++i) {
                 if (body_input_names.size() > (size_t)(i + 2) && carried[i]) {
                     tensor_t* t = ctx->search_tensor(body_input_names[i + 2]);
-                    if (t) t->apply(*carried[i]);
+                    if (t && !t->apply(*carried[i])) return false;
                 }
             }
 
-            // Execute body
+            // Execute body. Skip ops whose reshape rejects the input or whose
+            // inputs/outputs have null data — without this guard, a failed
+            // reshape upstream cascades to downstream ops dereferencing nulls
+            // (e.g. ssd_mobilenet's NMS body has 5800 nodes; one bad Gather
+            // makes Squeeze.exec crash on a null pointer).
             for (auto* n : body->nodes) {
-                n->reshape();
-                n->exec();
+                if (!n->reshape()) continue;
+                bool safe = true;
+                for (auto* t : n->inputs)
+                    if (t && (!t->data || t->type == NNR_DATA_TYPE_UNDEFINED)) { safe = false; break; }
+                for (auto* t : n->outputs)
+                    if (t && !t->data && t->type != NNR_DATA_TYPE_UNDEFINED) { safe = false; break; }
+                if (safe) n->exec();
             }
 
             // Read condition output
@@ -108,7 +211,9 @@ struct Loop_operator : public operator_t {
                     if (t && t->ndata > 0 && t->data) {
                         if (!carried[i])
                             carried[i] = new (std::nothrow) tensor_t("", t->type, t->dim_span());
-                        if (carried[i]) carried[i]->apply(*t);
+                        if (carried[i] && !carried[i]->allocation_failed) {
+                            if (!carried[i]->apply(*t)) return false;
+                        }
                     }
                 }
             }
@@ -126,8 +231,11 @@ struct Loop_operator : public operator_t {
         }
 
         // Write final carried variables to outputs
-        for (int i = 0; i < num_carried && i < (int)outputs.size(); ++i)
-            if (outputs[i] && carried[i]) outputs[i]->apply(*carried[i]);
+        for (int i = 0; i < num_carried && i < (int)outputs.size(); ++i) {
+            if (outputs[i] && carried[i]) {
+                if (!outputs[i]->apply(*carried[i])) return false;
+            }
+        }
 
         // Write scan outputs
         for (int i = 0; i < num_scan && (num_carried + i) < (int)outputs.size(); ++i) {

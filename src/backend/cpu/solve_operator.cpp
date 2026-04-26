@@ -8,6 +8,9 @@ namespace nnr {
 #include "ops.h"
 #undef X
 
+// Internal-only ops (not in ops.h since they aren't ONNX ops).
+operator_t* resolver_default_op_Reorder(int opset, pool_t& pool);
+
 namespace {
 
 // Auto-register all CPU operators at static-init time.
@@ -21,14 +24,28 @@ struct cpu_registrar {
         #define X(name) r.register_op(#name, backend_t::CPU, resolver_default_op_##name);
         #include "ops.h"
         #undef X
+        // Internal ops registered manually — not driven by ops.h.
+        r.register_op("Reorder", backend_t::CPU, resolver_default_op_Reorder);
     }
 } cpu_registrar_instance;
 
 } // namespace
 
+#ifdef NNR_ENABLE_WEBGPU
+// Forward-declared (not via header) to keep this TU free of WebGPU headers.
+// The reference below creates a link-time dependency on the WebGPU backend's
+// solve_operator.cpp, preventing MSVC dead-stripping of its webgpu_registrar
+// static — same mechanism that keeps cpu_registrar_instance alive.
+namespace webgpu { void ensure_registered(); }
+#endif
+
 operator_t* solve_operator(std::string_view op_type, int opset, pool_t& pool,
                            backend_t preferred)
 {
+#ifdef NNR_ENABLE_WEBGPU
+    if (preferred == backend_t::WEBGPU)
+        webgpu::ensure_registered();
+#endif
     return global_registry().solve(op_type, opset, pool, preferred);
 }
 

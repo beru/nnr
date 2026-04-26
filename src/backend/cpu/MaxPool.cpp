@@ -1,4 +1,5 @@
 #include "nnr.h"
+#include "tensor_view.h"
 #include "layout_cost.h"
 #include "util.h"
 #include "kernel/pool.h"
@@ -176,7 +177,18 @@ struct MaxPool_operator : public operator_t {
         float bytes = (float)C * H * W * 4 + (float)y->dims[1] * y->dims[2] * y->dims[3] * 4;
         if (layout == memory_layout_t::NHWC)
             return bytes / nhwc_patch_util(C);
+        if (layout == memory_layout_t::BLOCKED_16 || layout == memory_layout_t::BLOCKED_8) {
+            int block = (layout == memory_layout_t::BLOCKED_16) ? 16 : 8;
+            return bytes / block_simd_util(C, block);
+        }
         return bytes;
+    }
+
+    bool supports_strided_output(memory_layout_t format) const override {
+        if (format != memory_layout_t::NHWC) return false;
+        if (outputs.size() > 1 && outputs[1]) return false;  // indices output
+        if (outputs.empty() || !outputs[0]) return false;
+        return outputs[0]->ndim == 4 && dilations_are_one() && storage_order == 0;
     }
 
     small_vector<op_cost_t, 8> estimate_costs(bool /*input_nhwc*/) const override {
@@ -253,6 +265,17 @@ struct MaxPool_operator : public operator_t {
             }
             // NHWC path
             if (x->format == memory_layout_t::NHWC && !has_indices) {
+                if (y->strides_set) {
+                    // Strided dst (NHWC channel-axis Concat alias): scalar kernel
+                    // with explicit ldc. The SIMD x86/NEON paths assume ldc=C.
+                    maxpool_2d_nhwc((const float*)x->data, (float*)y->data,
+                        x->dims[0], x->dims[1], x->dims[2], x->dims[3],
+                        y->dims[2], y->dims[3],
+                        kernels[0], kernels[1], strides[0], strides[1], cpads[0], cpads[1],
+                        make_addr(y).elem_stride<float>(3));
+                    y->format = memory_layout_t::NHWC;
+                    return true;
+                }
 #ifdef NNR_ARCH_X64
                 maxpool_2d_nhwc_x64((const float*)x->data, (float*)y->data,
                     x->dims[0], x->dims[1], x->dims[2], x->dims[3],
@@ -275,6 +298,15 @@ struct MaxPool_operator : public operator_t {
         }
         // NHWC path for uint8 (used in quantized chains)
         if (x->format == memory_layout_t::NHWC && !has_indices) {
+            if (y->strides_set) {
+                maxpool_2d_nhwc((const T*)x->data, (T*)y->data,
+                    x->dims[0], x->dims[1], x->dims[2], x->dims[3],
+                    y->dims[2], y->dims[3],
+                    kernels[0], kernels[1], strides[0], strides[1], cpads[0], cpads[1],
+                    make_addr(y).elem_stride<T>(3));
+                y->format = memory_layout_t::NHWC;
+                return true;
+            }
 #ifdef NNR_ARCH_X64
             if constexpr (std::is_same_v<T, uint8_t>) {
                 maxpool_2d_uint8_nhwc_x64((const uint8_t*)x->data, (uint8_t*)y->data,

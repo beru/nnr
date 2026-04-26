@@ -9,6 +9,13 @@ namespace {
 struct Concat_operator : public operator_t {
     int axis;
     int caxis;
+    // True when each input occupies one contiguous byte run in the output
+    // under NHWC physical ordering [N, H, W, C]. Set in reshape() based on
+    // dims and caxis; exec_impl uses a single-memcpy-per-input fast-path
+    // when y->format == NHWC and this is set. Required because the existing
+    // nblocks-loop path uses logical dim strides that mis-stride NHWC bytes
+    // for caxis != 1.
+    bool nhwc_single_contiguous = false;
 
     bool init() override {
         if (!(inputs.size() >= 1 && outputs.size() == 1)) {
@@ -51,9 +58,37 @@ struct Concat_operator : public operator_t {
             }
         }
         dims[caxis] = s;
-        // NHWC support: channel concat (axis=1) on 4D float tensors
+
+        layout_mask = LAYOUT_NCHW;
+        // NHWC support requires exec_impl to produce correct NHWC bytes.
+        // Two cases work:
+        //   (a) caxis=1 channel concat — strided memcpy below at line ~93,
+        //       handles arbitrary N/H/W with C-interleaved per spatial.
+        //   (b) any caxis where each input is a single contiguous byte run
+        //       in NHWC physical order — exec_impl falls into the
+        //       single-memcpy-per-input fast-path. Holds when the product of
+        //       *physical* NHWC dims [N, H, W, C] before the concat-axis's
+        //       physical position is 1:
+        //         caxis=0(N): outer=1 always
+        //         caxis=1(C): outer=N*H*W (this case overlaps with (a))
+        //         caxis=2(H): outer=N
+        //         caxis=3(W): outer=N*H
+        //   memory_planner uses the same physical-outer rule to gate
+        //   Concat-alias on NHWC inputs.
+        size_t nhwc_outer = 1;
+        if (ndim == 4) {
+            switch (caxis) {
+            case 0: nhwc_outer = 1; break;
+            case 1: nhwc_outer = (size_t)dims[0] * dims[2] * dims[3]; break;
+            case 2: nhwc_outer = (size_t)dims[0]; break;
+            case 3: nhwc_outer = (size_t)dims[0] * dims[2]; break;
+            }
+        }
+        nhwc_single_contiguous = (ndim == 4) && (nhwc_outer == 1);
         if (ndim == 4 && caxis == 1 && x->type == NNR_DATA_TYPE_FLOAT32)
-            layout_mask = LAYOUT_NCHW | LAYOUT_NHWC;
+            layout_mask |= LAYOUT_NHWC;
+        if (nhwc_single_contiguous)
+            layout_mask |= LAYOUT_NHWC;
         if (!y->reshape(dims, x->type)) return false;
         // Concat is quantization-transparent: propagate if all inputs share same quant params
         if (x->is_quantized()) {
@@ -87,6 +122,37 @@ struct Concat_operator : public operator_t {
             }
             if (all_aliased && offset == y->ndata * sz)
                 return true;
+        }
+
+        // Strided alias (NHWC channel-axis with H>1 or W>1): each input's data
+        // pointer lands inside `y` at start_C*elem_sz, and the producer Conv
+        // wrote with ldc = parent C. Producers and consumer Concat share the
+        // parent buffer; Concat is a no-op.
+        if (y->format == memory_layout_t::NHWC && y->ndim == 4 && caxis == 1) {
+            bool all_strided_aliased = !inputs.empty();
+            for (auto* x : inputs) {
+                if (!x || x->concat_parent != y || !x->strides_set) {
+                    all_strided_aliased = false;
+                    break;
+                }
+            }
+            if (all_strided_aliased) return true;
+        }
+
+        // NHWC single-contiguous fast-path: each input is one contiguous
+        // byte run in physical NHWC order. Layout-agnostic memcpy works.
+        // Covers caxis=0 always; caxis=2 N=1; caxis=3 N=H=1; caxis=1 N=H=W=1.
+        if (y->format == memory_layout_t::NHWC && nhwc_single_contiguous) {
+            char* py = (char*)y->data;
+            const size_t sz = data_type_sizeof(inputs[0]);
+            size_t offset_bytes = 0;
+            for (size_t idx = 0; idx < inputs.size(); ++idx) {
+                const tensor_t* x = inputs[idx];
+                size_t bytes = (size_t)x->ndata * sz;
+                memcpy(py + offset_bytes, x->data, bytes);
+                offset_bytes += bytes;
+            }
+            return true;
         }
 
         // NHWC channel concat: axis=1 in NCHW → innermost dim in NHWC

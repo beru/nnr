@@ -2,8 +2,10 @@
 // Each uses binary_arith_op_t CRTP base: init=is_inout_size(2,1), reshape=multi_broadcast, exec=binary_broadcast_exec.
 
 #include "nnr.h"
+#include "tensor_view.h"
 #include "util.h"
 #include "thread_pool.h"
+#include <limits>
 #ifdef NNR_ARCH_X64
 #include "backend/x64/simd_math_avx512.h"
 #include "backend/x64/ops_x64.h"
@@ -38,6 +40,28 @@ static NNR_NOINLINE void add_float_threaded(
 #else
         for (size_t i = start; i < end; ++i)
             py[i] = pa[i] + pb[i];
+#endif
+    });
+}
+
+// Threaded fused max(0, a+b). Same blocking/cost as add_float_threaded but
+// applies Relu in-register before the store. One pass over the output.
+static NNR_NOINLINE void add_relu_float_threaded(
+    const float* pa, const float* pb, float* py, size_t l)
+{
+    int nt = nnr::elementwise_threads(l, 8, 4, 1);
+    constexpr size_t BLOCK = 4096;
+    int nblocks = (int)((l + BLOCK - 1) / BLOCK);
+    nnr::for_dynamic(0, nblocks, nt, [&](int /*tid*/, int blk) {
+        size_t start = (size_t)blk * BLOCK;
+        size_t end = std::min(start + BLOCK, l);
+#ifdef NNR_ARCH_X64
+        add_relu_vec_avx512(py, pa, pb, start, end);
+#else
+        for (size_t i = start; i < end; ++i) {
+            float v = pa[i] + pb[i];
+            py[i] = v > 0.0f ? v : 0.0f;
+        }
 #endif
     });
 }
@@ -79,6 +103,17 @@ struct Add_op : public binary_arith_op_t<Add_op,
         return true;
     }
 
+    bool supports_strided_output(memory_layout_t format) const override {
+        if (format != memory_layout_t::NHWC) return false;
+        if (inputs.size() < 2 || outputs.empty() || !outputs[0]) return false;
+        auto* a = inputs[0]; auto* b = inputs[1]; auto* y = outputs[0];
+        if (!a || !b) return false;
+        if (y->ndim != 4 || y->type != NNR_DATA_TYPE_FLOAT32) return false;
+        // Only same-shape (no broadcast).
+        if (a->ndata != y->ndata || b->ndata != y->ndata) return false;
+        return true;
+    }
+
     scroll_info_t scroll_info() const override {
         if (inputs.size() != 2 || outputs.size() != 1) return {};
         auto* a = inputs[0]; auto* b = inputs[1];
@@ -87,29 +122,83 @@ struct Add_op : public binary_arith_op_t<Add_op,
         // Same shape on N, C, W (skip H which may differ under ring buffer)
         if (a->dims[0] != b->dims[0] || a->dims[1] != b->dims[1] ||
             a->dims[3] != b->dims[3]) return {};
+        // exec_strip uses y->declared_layout for the per-channel-block
+        // stride. Mismatched declared_layouts across a/b/y would mis-stride
+        // the addressing because the ring buffer was sized using one of
+        // them while exec_strip uses another.
+        auto* y = outputs[0];
+        if (a->declared_layout != y->declared_layout) return {};
+        if (b->declared_layout != y->declared_layout) return {};
         return { .scrollable = true };
     }
 
     bool exec() override {
         auto* a = inputs[0]; auto* b = inputs[1]; auto* y = outputs[0];
+        // Strided NHWC (Concat alias): output's spatial-major stride is
+        // ldc = parent C, not local C. Same-shape, same-format inputs only.
+        if (y->strides_set && y->format == memory_layout_t::NHWC && y->ndim == 4
+            && a->ndata == y->ndata && b->ndata == y->ndata
+            && a->format == memory_layout_t::NHWC && b->format == memory_layout_t::NHWC
+            && a->type == NNR_DATA_TYPE_FLOAT32) {
+            const int N = y->dims[0], C = y->dims[1], H = y->dims[2], W = y->dims[3];
+            const int NHW = N * H * W;
+            const int ldc = make_addr(y).elem_stride<float>(3);
+            const float* pa = (const float*)a->data;
+            const float* pb = (const float*)b->data;
+            float* py = (float*)y->data;
+            nnr::for_static(0, NHW, NHW > 16, [&](int s) {
+                const float* sa = pa + (size_t)s * C;
+                const float* sb = pb + (size_t)s * C;
+                float* sy = py + (size_t)s * ldc;
+                for (int c = 0; c < C; ++c) sy[c] = sa[c] + sb[c];
+            });
+            y->format = memory_layout_t::NHWC;
+            if (post_fn)
+                post_fn((float*)y->data, NHW, C, ldc, fused_op, nullptr, 0);
+            return true;
+        }
         // Same element count = effectively same-shape (broadcast dims are all 1)
         if (a->type == NNR_DATA_TYPE_FLOAT32
             && a->ndata == b->ndata && a->ndata == y->ndata && a->ndata > 1024) {
+            // Single-pass Add+Relu fast path: when the fused unary post-op is
+            // a leaf Relu (no further chain), compute max(0, a+b) in registers
+            // before the store. Avoids the second full pass over y that a
+            // separate post_fn would require.
+            const bool fuse_relu = post_fn != nullptr
+                && fused_op != nullptr
+                && fused_op->op_type == "Relu"
+                && fused_op->post_fn == nullptr;
 #ifdef NNR_ARCH_X64
             // For small tensors (<4M elements / 16MB), single-threaded AVX-512
             // is faster than thread dispatch overhead (~50µs wake+sync).
             if (a->ndata < 4 * 1024 * 1024) {
-                add_vec_avx512((float*)y->data, (const float*)a->data,
-                               (const float*)b->data, 0, y->ndata);
+                if (fuse_relu) {
+                    add_relu_vec_avx512((float*)y->data, (const float*)a->data,
+                                        (const float*)b->data, 0, y->ndata);
+                } else {
+                    add_vec_avx512((float*)y->data, (const float*)a->data,
+                                   (const float*)b->data, 0, y->ndata);
+                }
+            } else if (fuse_relu) {
+                add_relu_float_threaded((const float*)a->data, (const float*)b->data,
+                                        (float*)y->data, y->ndata);
             } else {
                 add_float_threaded((const float*)a->data, (const float*)b->data,
                                    (float*)y->data, y->ndata);
             }
 #else
-            add_float_threaded((const float*)a->data, (const float*)b->data,
-                               (float*)y->data, y->ndata);
+            if (fuse_relu) {
+                add_relu_float_threaded((const float*)a->data, (const float*)b->data,
+                                        (float*)y->data, y->ndata);
+            } else {
+                add_float_threaded((const float*)a->data, (const float*)b->data,
+                                   (float*)y->data, y->ndata);
+            }
 #endif
             y->format = a->format;
+            if (post_fn && !fuse_relu)
+                post_fn((float*)y->data, 1, (int)y->ndata, (int)y->ndata,
+                        fused_op, nullptr, 0);
             return true;
         }
         // Fast path: bias broadcast [N] + [*,N] or [*,N] + [N]
@@ -144,10 +233,18 @@ struct Add_op : public binary_arith_op_t<Add_op,
                 }
 #endif
                 y->format = full->format;
+                if (post_fn)
+                    post_fn(py, 1, (int)y->ndata, (int)y->ndata,
+                            fused_op, nullptr, 0);
                 return true;
             }
         }
-        return binary_arith_op_t::exec();
+        bool ok = binary_arith_op_t::exec();
+        if (ok && post_fn && y->type == NNR_DATA_TYPE_FLOAT32 && y->data) {
+            post_fn((float*)y->data, 1, (int)y->ndata, (int)y->ndata,
+                    fused_op, nullptr, 0);
+        }
+        return ok;
     }
 
     bool exec_strip(int out_row_start, int out_rows,
@@ -174,7 +271,12 @@ struct Add_op : public binary_arith_op_t<Add_op,
 
         // BLOCKED_16/8: row width is W*block per channel block.
         // NCHW: row width is W per channel.
-        bool blocked = (y->format == NATIVE_BLOCKED_FMT);
+        // Check declared_layout, not format — at first-run setup time the
+        // ring buffer is sized using declared_layout (see scroll_chains.cpp),
+        // and y->format may still be the default NCHW even though the
+        // upstream Conv will write BLOCKED bytes. Mismatched block size here
+        // mis-strides the addressing and overflows the ring buffer.
+        bool blocked = (y->declared_layout == NATIVE_BLOCKED_FMT);
         int block = blocked ? NATIVE_BLOCK : 1;
         int NC = blocked
             ? y->dims[0] * (y->dims[1] / block)
@@ -185,6 +287,8 @@ struct Add_op : public binary_arith_op_t<Add_op,
         const float* pa = (const float*)a->data;
         const float* pb = (const float*)b->data;
         float* py = (float*)y->data;
+        post_fn_t pf = post_fn;
+        const operator_t* fop = fused_op;
         nnr::for_static(0, NC, NC > 4, [&](int nc) {
             const float* sa = pa + (size_t)nc * aH * row_elems + (size_t)out_row_start * row_elems;
             const float* sb = pb + (size_t)nc * bH * row_elems + (size_t)out_row_start * row_elems;
@@ -199,6 +303,10 @@ struct Add_op : public binary_arith_op_t<Add_op,
             for (int i = 0; i < count; ++i)
                 dst[i] = sa[i] + sb[i];
 #endif
+            // Fused unary post-op (e.g. Relu) over this channel-block's strip
+            // rows. Hot data is in L1 from the just-completed adds; applying
+            // here avoids a second pass over the whole output tensor.
+            if (pf) pf(dst, 1, count, count, fop, nullptr, 0);
         });
         return true;
     }
@@ -279,7 +387,25 @@ struct Div_op : public binary_arith_op_t<Div_op,
     opset_t<7, int32_t, int64_t, uint32_t, uint64_t, float16_t, float, double>>
 {
     using binary_arith_op_t::exec;
-    static auto fn(auto a, auto b) { return a / b; }
+    // Float division yields inf/NaN and stays defined; integer division
+    // by zero (and the signed INT_MIN / -1 case) is UB and on x86 raises
+    // SIGFPE. ONNX does not fully specify integer divide-by-zero, but the
+    // runtime must not crash — return 0 in those cases.
+    static auto fn(auto a, auto b) {
+        using A = decltype(a);
+        using B = decltype(b);
+        if constexpr (std::is_integral_v<A> && std::is_integral_v<B>) {
+            if (b == 0) return A(0);
+            if constexpr (std::is_signed_v<A> && std::is_signed_v<B>) {
+                // INT_MIN / -1 is UB on signed two's-complement integers.
+                if (b == B(-1) && a == std::numeric_limits<A>::min())
+                    return std::numeric_limits<A>::min();
+            }
+            return A(a / b);
+        } else {
+            return a / b;
+        }
+    }
 
     bool exec() override {
         auto* a = inputs[0]; auto* b = inputs[1]; auto* y = outputs[0];

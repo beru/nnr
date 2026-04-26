@@ -8,6 +8,8 @@
 #include "cpu_features.h"
 #ifdef NNR_ARCH_X64
 #include "backend/x64/sdpa_avx512.h"
+#elif defined(NNR_ARCH_ARM64)
+#include "backend/arm/sdpa_neon.h"
 #endif
 
 namespace nnr {
@@ -41,6 +43,14 @@ struct SDPA_operator : public operator_t {
 #ifdef NNR_ARCH_X64
         if (Q->type == NNR_DATA_TYPE_FLOAT32) {
             sdpa_multihead_avx512(
+                (const float*)Q->data, (const float*)K->data,
+                (const float*)V->data, (float*)O->data,
+                batch, seq_len, head_dim);
+            return true;
+        }
+#elif defined(NNR_ARCH_ARM64)
+        if (Q->type == NNR_DATA_TYPE_FLOAT32) {
+            sdpa_multihead_neon(
                 (const float*)Q->data, (const float*)K->data,
                 (const float*)V->data, (float*)O->data,
                 batch, seq_len, head_dim);

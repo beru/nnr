@@ -39,10 +39,19 @@ struct Unsqueeze_1_11_operator : public operator_t {
 
     bool exec_impl() {
         tensor_t* y = outputs[0];
-        if (!y->owns_data)
+        if (!y->owns_data) {
+            // Re-derive y's shape from x's live dims — an upstream
+            // NonMaxSuppression can shrink x->dims during exec(), and the
+            // fast path skips reshape(). Without this, y->ndata stays at
+            // the prepare-time upper bound while y->data aliases the
+            // shrunken input, so downstream consumers read past the live
+            // region (yolov3-tiny NMS→Unsqueeze→Cast crash).
+            if (!reshape()) return false;
             y->data = inputs[0]->data;  // zero-copy view
-        else if (y->data != inputs[0]->data)
+        }
+        else if (y->data != inputs[0]->data) {
             copy_data(y, inputs[0]);
+        }
         return true;
     }
 
@@ -113,10 +122,14 @@ struct Unsqueeze_13_operator : public operator_t {
 
     bool exec_impl() {
         tensor_t* y = outputs[0];
-        if (!y->owns_data)
-            y->data = inputs[0]->data;  // zero-copy view
-        else if (y->data != inputs[0]->data)
+        if (!y->owns_data) {
+            // See Unsqueeze_1_11_operator::exec_impl — same dynamic-shape rule.
+            if (!reshape()) return false;
+            y->data = inputs[0]->data;
+        }
+        else if (y->data != inputs[0]->data) {
             copy_data(y, inputs[0]);
+        }
         return true;
     }
 

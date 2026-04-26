@@ -15,16 +15,20 @@ struct Sigmoid_operator : public operator_t {
 
     static void apply_inplace(float* data, int rows, int cols, int stride,
                               const operator_t* self, const float* bias, int offset) {
+        const bool fused_silu = self->is_fused_silu;
+#if defined(NNR_ARCH_X64) || defined(NNR_ARCH_ARM64)
+        if (!bias && stride == cols) {
+            size_t n = (size_t)rows * cols;
+            // post_fn is invoked from worker threads (gemm post-ops, depthwise
+            // strip, etc.); call the single-threaded `_kernel` variants to
+            // avoid nested for_static deadlock.
 #ifdef NNR_ARCH_X64
-        if (!bias && stride == cols) {
-            sigmoid_avx512(data, (size_t)rows * cols);
-            if (self->post_fn)
-                self->post_fn(data, rows, cols, stride, self->fused_op, nullptr, offset);
-            return;
-        }
-#elifdef NNR_ARCH_ARM64
-        if (!bias && stride == cols) {
-            sigmoid_neon(data, (size_t)rows * cols);
+            if (fused_silu) silu_avx512_kernel(data, data, n);
+            else            sigmoid_avx512_kernel(data, n);
+#else
+            if (fused_silu) silu_neon_kernel(data, data, n);
+            else            sigmoid_neon_kernel(data, n);
+#endif
             if (self->post_fn)
                 self->post_fn(data, rows, cols, stride, self->fused_op, nullptr, offset);
             return;
@@ -33,8 +37,15 @@ struct Sigmoid_operator : public operator_t {
         for (int r = 0; r < rows; r++) {
             float* row = data + (size_t)r * stride;
             float bv = bias ? bias[r] : 0.0f;
-            for (int i = 0; i < cols; ++i)
-                row[i] = 1.0f / (1.0f + expf(-(row[i] + bv)));
+            if (fused_silu) {
+                for (int i = 0; i < cols; ++i) {
+                    float v = row[i] + bv;
+                    row[i] = v / (1.0f + expf(-v));
+                }
+            } else {
+                for (int i = 0; i < cols; ++i)
+                    row[i] = 1.0f / (1.0f + expf(-(row[i] + bv)));
+            }
         }
         if (self->post_fn)
             self->post_fn(data, rows, cols, stride, self->fused_op, nullptr, offset);
@@ -57,8 +68,19 @@ struct Sigmoid_operator : public operator_t {
     {
         const tensor_t* x = inputs[0];
         tensor_t* y = outputs[0];
-#ifdef NNR_ARCH_ARM64
-        // NEON fast path for scroll strip: process the strip directly
+        // Element-wise strip path addresses px/py with different per-channel
+        // strides (iH*W vs oH*W). When the chain pairs a full-buffer input
+        // with a ring-buffer output (yolov10n's stem-Conv → SiLU), x and y
+        // also disagree on channel-block layout (NCHW vs BLOCKED_16) and the
+        // per-channel offsets walk into the wrong heap region. Bail so the
+        // segment is pruned and the op runs via the non-scroll exec() path.
+        if (x->ndim >= 2 && y->ndim >= 2
+            && x->dims[x->ndim - 2] != y->dims[y->ndim - 2]) {
+            return false;
+        }
+#if defined(NNR_ARCH_X64) || defined(NNR_ARCH_ARM64)
+        // SIMD fast path for scroll strip: process the strip directly with
+        // vectorized sigmoid/silu, parallelized across outer NC dims.
         {
             int NC = 1;
             for (int d = 0; d < x->ndim - 2; d++) NC *= x->dims[d];
@@ -70,23 +92,19 @@ struct Sigmoid_operator : public operator_t {
             if (count <= 0) return true;
             const float* px = (const float*)x->data;
             float* py = (float*)y->data;
-            for (int nc = 0; nc < NC; nc++) {
+            const bool fused_silu_local = is_fused_silu;
+            nnr::for_static(0, NC, NC > 1, [&](int nc) {
                 const float* src = px + (size_t)nc * iH * W + (size_t)out_row_start * W;
                 float* dst = py + (size_t)nc * oH * W + (size_t)out_row_start * W;
                 if (src != dst) memcpy(dst, src, count * sizeof(float));
-                size_t i = 0;
-                if (is_fused_silu) {
-                    for (; i + 4 <= (size_t)count; i += 4)
-                        vst1q_f32(dst + i, silu_neon_ps(vld1q_f32(dst + i)));
-                    for (; i < (size_t)count; i++)
-                        dst[i] = dst[i] / (1.0f + expf(-dst[i]));
-                } else {
-                    for (; i + 4 <= (size_t)count; i += 4)
-                        vst1q_f32(dst + i, sigmoid_neon_ps(vld1q_f32(dst + i)));
-                    for (; i < (size_t)count; i++)
-                        dst[i] = 1.0f / (1.0f + expf(-dst[i]));
-                }
-            }
+#ifdef NNR_ARCH_X64
+                if (fused_silu_local) silu_avx512_kernel(dst, dst, count);
+                else                  sigmoid_avx512_kernel(dst, count);
+#else // NNR_ARCH_ARM64
+                if (fused_silu_local) silu_neon_kernel(dst, dst, count);
+                else                  sigmoid_neon_kernel(dst, count);
+#endif
+            });
             return true;
         }
 #endif
@@ -135,11 +153,11 @@ struct Sigmoid_operator : public operator_t {
                 return x * s;
             });
         } else {
-            foreach_tensor<T>([](auto x){
+            foreach_tensor<T>([](auto x) -> T {
                 if (x >= 0) {
-                    return (T)1.0 / ((T)1.0 + (T)exp(-1 * x));
+                    return (T)((T)1.0 / ((T)1.0 + (T)exp(-1 * x)));
                 } else {
-                    return exp(x) / ((T)1.0 + (T)exp(x));
+                    return (T)(exp(x) / ((T)1.0 + (T)exp(x)));
                 }
             });
         }

@@ -1,4 +1,5 @@
 #include "graph_optimizer/graph_optimizer_internal.h"
+#include "aligned_alloc.h"
 
 namespace nnr {
 
@@ -141,8 +142,13 @@ void fuse_qdq(context_t* ctx)
         for (auto& t : consumer->outputs)
             if (t == consumer_output) t = q_output;
 
-        // Output type and shape must match for quantized storage
-        q_output->reinit(dq_input->type, consumer_output->dim_span());
+        // Output type and shape must match for quantized storage. Use
+        // reshape() rather than reinit() so the call short-circuits when
+        // q_output already has the right shape/type — bare reinit() always
+        // frees data + calls webgpu::forget(), evicting any GPU buffer that
+        // an earlier fuse_qdq_compute round registered for this tensor.
+        if (!q_output->reshape(consumer_output->dim_span(), dq_input->type))
+            continue;
 
         // Mark DQ and Q as folded (not skip).  After rewiring the consumer,
         // these nodes' I/O tensors are orphaned.  Using 'skip' would cause
@@ -154,11 +160,33 @@ void fuse_qdq(context_t* ctx)
 
         // Re-reshape the consumer so workspace_size() reflects quantized path,
         // and ensure workspace is large enough for the dequantize float buffer.
-        consumer->reshape();
+        // GPU backends (WebGPU pool/elementwise) commonly reject non-float32
+        // inputs; after rewiring the inputs to int8/uint8 their reshape returns
+        // false and any per-tensor backend state (GPU buffers, pipelines) is
+        // never set up — runtime exec then dereferences null. Demote to a
+        // CPU consumer in that case.
+        if (!consumer->reshape() && consumer->resolved_backend != static_cast<uint8_t>(backend_t::CPU)) {
+            operator_t* cpu_c = solve_operator(consumer->op_type, consumer->opset,
+                                               ctx->attr_pool, backend_t::CPU);
+            if (cpu_c) {
+                cpu_c->ctx       = ctx;
+                cpu_c->opset     = consumer->opset;
+                cpu_c->op_type   = consumer->op_type;
+                cpu_c->node_name = consumer->node_name;
+                cpu_c->domain    = consumer->domain;
+                cpu_c->inputs    = consumer->inputs;
+                cpu_c->outputs   = consumer->outputs;
+                cpu_c->attrs     = consumer->attrs;
+                if (cpu_c->init() && cpu_c->reshape()) {
+                    nodes[consumer_idx] = cpu_c;
+                    consumer = cpu_c;
+                }
+            }
+        }
         size_t ws = consumer->workspace_size();
         if (ws > ctx->workspace_size) {
-            _aligned_free(ctx->workspace);
-            ctx->workspace = _aligned_malloc(ws, 64);
+            nnr_aligned_free(ctx->workspace);
+            ctx->workspace = nnr_aligned_alloc(ws, 64);
             ctx->workspace_size = ws;
         }
 

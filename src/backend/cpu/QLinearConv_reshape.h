@@ -71,7 +71,7 @@
             int MM_val = M_total / group;
 
             // Convert W to float32 (subtract zero-point) and pre-pack with pack_a
-            float* w_f32_tmp = (float*)_aligned_malloc(wt->ndata * sizeof(float), 64);
+            float* w_f32_tmp = (float*)nnr_aligned_alloc(wt->ndata * sizeof(float), 64);
             for (int oc = 0; oc < M_total; oc++) {
                 int32_t wzp = 0;
                 if (!per_channel_zp_ && w_zp_t->ndata > 0) {
@@ -93,7 +93,7 @@
             for (int g_idx = 0; g_idx < group; g_idx++)
                 pack_a(w_packed_f32.data() + g_idx * per_group,
                     w_f32_tmp + (size_t)g_idx * MM_val * CHW_val, MM_val, CHW_val);
-            _aligned_free(w_f32_tmp);
+            nnr_aligned_free(w_f32_tmp);
         }
 #ifdef NNR_ARCH_X64
         // Also pre-shift W for VNNI path (if available)
@@ -281,6 +281,75 @@
                 // Zero buffer for padding pixels (filled with x_zp at exec time)
                 dw_zero_buf.resize(C_pad);
             }
+        }
+#endif
+
+#ifdef NNR_ARCH_ARM64
+        // Depthwise int8 on ARM: repack weights into [kH*kW, C_pad] layout (C_pad = round_up(OC, 4))
+        // so the NEON depthwise_int8_nhwc kernel can load 8 channels per iter.
+        // Eligible: group == OC, C_per_group == 1, uint8 input, symmetric per-tensor w_zp, dotprod CPU.
+        if (has_neon_dotprod() && x->ndim == 4
+            && x->type == NNR_DATA_TYPE_UINT8 && !per_channel_zp_) {
+            const tensor_t* wt = inputs[3];
+            int OC_val = wt->dims[0];
+            int kH_val = wt->dims[2];
+            int kW_val = wt->dims[3];
+            if (group == OC_val && wt->dims[1] == 1) {
+                int kHW = kH_val * kW_val;
+                int oH_val = dims[2];
+                int oW_val = dims[3];
+                int C_pad = (OC_val + 3) & ~3;  // ARM NEON aligns to 4 (vs 16 on AVX-512)
+
+                w_dw_repacked.resize(int8::neon::repack_depthwise_weights_neon_size(OC_val, kH_val, kW_val));
+                int8::neon::repack_depthwise_weights_neon(
+                    w_dw_repacked.data(), (const int8_t*)wt->data,
+                    OC_val, kH_val, kW_val);
+
+                dw_ind_buf.resize((size_t)oH_val * oW_val * kHW);
+                dw_zero_buf.resize(C_pad);
+            }
+        }
+
+        // Direct int8 conv on ARM: pack weights into SDOT (OC4×IC4) tile layout.
+        // Eligible: group==1, dilation==1, uint8 input, symmetric per-tensor ZP, dotprod CPU.
+        if (has_neon_dotprod() && x->ndim == 4
+            && x->type == NNR_DATA_TYPE_UINT8 && !per_channel_zp_
+            && group == 1
+            && dilations[0] == 1 && dilations[1] == 1) {
+            const tensor_t* wt = inputs[3];
+            int OC_val = wt->dims[0];
+            int IC_val = wt->dims[1];
+            int kH_val = wt->dims[2];
+            int kW_val = wt->dims[3];
+
+            w_direct_buf.resize(pack_weights_int8_direct_neon_size(OC_val, IC_val, kH_val, kW_val));
+            pack_weights_int8_direct_neon(w_direct_buf.data(),
+                (const int8_t*)wt->data, OC_val, IC_val, kH_val, kW_val);
+
+            w_direct_sums.resize(OC_val);
+            compute_weight_sums_int8_direct_neon(w_direct_sums.data(),
+                (const int8_t*)wt->data, OC_val, IC_val, kH_val, kW_val);
+
+  #if defined(__ARM_FEATURE_MATMUL_INT8) || (defined(_MSC_VER) && defined(_M_ARM64))
+            // When the CPU has i8mm, also build the SMMLA pack (2-OC × 8-IC tile).
+            // The same pack feeds both the NHWC exec path (direct) and the NCHW exec
+            // path (which pre-transposes activations to NHWC in a scratch buffer and
+            // runs the SMMLA body with NCHW-layout stores). SDOT pack above remains
+            // as fallback for non-i8mm chips and for the NHWC path's initial build.
+            if (has_neon_i8mm()) {
+                w_direct_smmla_buf.resize(
+                    pack_weights_int8_direct_nhwc_smmla_size(OC_val, IC_val, kH_val, kW_val));
+                pack_weights_int8_direct_nhwc_smmla(w_direct_smmla_buf.data(),
+                    (const int8_t*)wt->data, OC_val, IC_val, kH_val, kW_val);
+            } else {
+                w_direct_smmla_buf.clear();
+            }
+  #endif
+
+            // The same SDOT pack feeds exec_direct_int8_nhwc_neon — advertise
+            // NHWC so the graph optimizer can avoid NCHW↔NHWC transposes at op
+            // boundaries (mirrors the x64 VNNI gate above).
+            layout_mask = LAYOUT_NCHW | LAYOUT_NHWC;
         }
 #endif
 
