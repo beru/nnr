@@ -8,6 +8,7 @@
 #include <limits>
 #ifdef NNR_ARCH_X64
 #include "backend/x64/simd_math_avx512.h"
+#include "backend/x64/simd_math_avx2.h"
 #include "backend/x64/ops_x64.h"
 #elifdef NNR_ARCH_ARM64
 #include "backend/arm/conv_neon.h"
@@ -34,7 +35,8 @@ static NNR_NOINLINE void add_float_threaded(
         size_t start = (size_t)blk * BLOCK;
         size_t end = std::min(start + BLOCK, l);
 #ifdef NNR_ARCH_X64
-        add_vec_avx512(py, pa, pb, start, end);
+        if (has_avx512()) add_vec_avx512(py, pa, pb, start, end);
+        else              add_vec_avx2(py, pa, pb, start, end);
 #elifdef NNR_ARCH_ARM64
         add_vec_neon(py, pa, pb, start, end);
 #else
@@ -56,7 +58,8 @@ static NNR_NOINLINE void add_relu_float_threaded(
         size_t start = (size_t)blk * BLOCK;
         size_t end = std::min(start + BLOCK, l);
 #ifdef NNR_ARCH_X64
-        add_relu_vec_avx512(py, pa, pb, start, end);
+        if (has_avx512()) add_relu_vec_avx512(py, pa, pb, start, end);
+        else              add_relu_vec_avx2(py, pa, pb, start, end);
 #else
         for (size_t i = start; i < end; ++i) {
             float v = pa[i] + pb[i];
@@ -173,11 +176,19 @@ struct Add_op : public binary_arith_op_t<Add_op,
             // is faster than thread dispatch overhead (~50µs wake+sync).
             if (a->ndata < 4 * 1024 * 1024) {
                 if (fuse_relu) {
-                    add_relu_vec_avx512((float*)y->data, (const float*)a->data,
-                                        (const float*)b->data, 0, y->ndata);
+                    if (has_avx512())
+                        add_relu_vec_avx512((float*)y->data, (const float*)a->data,
+                                            (const float*)b->data, 0, y->ndata);
+                    else
+                        add_relu_vec_avx2((float*)y->data, (const float*)a->data,
+                                          (const float*)b->data, 0, y->ndata);
                 } else {
-                    add_vec_avx512((float*)y->data, (const float*)a->data,
-                                   (const float*)b->data, 0, y->ndata);
+                    if (has_avx512())
+                        add_vec_avx512((float*)y->data, (const float*)a->data,
+                                       (const float*)b->data, 0, y->ndata);
+                    else
+                        add_vec_avx2((float*)y->data, (const float*)a->data,
+                                     (const float*)b->data, 0, y->ndata);
                 }
             } else if (fuse_relu) {
                 add_relu_float_threaded((const float*)a->data, (const float*)b->data,
@@ -218,11 +229,16 @@ struct Add_op : public binary_arith_op_t<Add_op,
                 int rows = (int)(y->ndata / N);
 #ifdef NNR_ARCH_X64
                 if (y->ndata < 4 * 1024 * 1024) {
-                    add_bias_broadcast_avx512(py, pf, pb, rows, N);
+                    if (has_avx512()) add_bias_broadcast_avx512(py, pf, pb, rows, N);
+                    else              add_bias_broadcast_avx2(py, pf, pb, rows, N);
                 } else {
                     nnr::for_static(0, rows, true, [&](int r) {
-                        add_bias_broadcast_avx512(py + (size_t)r * N,
-                            pf + (size_t)r * N, pb, 1, N);
+                        if (has_avx512())
+                            add_bias_broadcast_avx512(py + (size_t)r * N,
+                                pf + (size_t)r * N, pb, 1, N);
+                        else
+                            add_bias_broadcast_avx2(py + (size_t)r * N,
+                                pf + (size_t)r * N, pb, 1, N);
                     });
                 }
 #else
@@ -328,9 +344,27 @@ struct Sub_op : public binary_arith_op_t<Sub_op,
 #ifdef NNR_ARCH_X64
         if (a->type == NNR_DATA_TYPE_FLOAT32
             && a->ndata == b->ndata && a->ndata == y->ndata && a->ndata > 1024) {
-            sub_avx512((const float*)a->data, (const float*)b->data,
-                       (float*)y->data, y->ndata);
+            if (has_avx512())
+                sub_avx512((const float*)a->data, (const float*)b->data,
+                           (float*)y->data, y->ndata);
+            else
+                sub_avx2((const float*)a->data, (const float*)b->data,
+                         (float*)y->data, y->ndata);
             y->format = a->format;
+            return true;
+        }
+        if (a->type == NNR_DATA_TYPE_FLOAT32 && y->type == NNR_DATA_TYPE_FLOAT32
+            && a->type == b->type && y->ndata > 1024 && y->ndim > 0
+            && y->ndim <= MAX_NDIM) {
+            int a_bstr[MAX_NDIM], b_bstr[MAX_NDIM];
+            compute_broadcast_strides(a, y, a_bstr);
+            compute_broadcast_strides(b, y, b_bstr);
+            if (has_avx512())
+                sub_broadcast_avx512((const float*)a->data, (const float*)b->data,
+                    (float*)y->data, y->dims, a_bstr, b_bstr, y->ndim);
+            else
+                sub_broadcast_avx2((const float*)a->data, (const float*)b->data,
+                    (float*)y->data, y->dims, a_bstr, b_bstr, y->ndim);
             return true;
         }
 #endif
@@ -355,9 +389,30 @@ struct Mul_op : public binary_arith_op_t<Mul_op,
 #ifdef NNR_ARCH_X64
         if (a->type == NNR_DATA_TYPE_FLOAT32
             && a->ndata == b->ndata && a->ndata == y->ndata && a->ndata > 1024) {
-            mul_avx512((const float*)a->data, (const float*)b->data,
-                       (float*)y->data, y->ndata);
+            if (has_avx512())
+                mul_avx512((const float*)a->data, (const float*)b->data,
+                           (float*)y->data, y->ndata);
+            else
+                mul_avx2((const float*)a->data, (const float*)b->data,
+                         (float*)y->data, y->ndata);
             y->format = a->format;
+            return true;
+        }
+        // Broadcast SIMD path for fp32: covers PER_CHANNEL/GENERAL kinds whose
+        // scalar fallback in binary_broadcast_exec dominated YOLO post-proc
+        // (mul_18 in yolov3-12-int8 was 7.3 ms scalar, single-threaded).
+        if (a->type == NNR_DATA_TYPE_FLOAT32 && y->type == NNR_DATA_TYPE_FLOAT32
+            && a->type == b->type && y->ndata > 1024 && y->ndim > 0
+            && y->ndim <= MAX_NDIM) {
+            int a_bstr[MAX_NDIM], b_bstr[MAX_NDIM];
+            compute_broadcast_strides(a, y, a_bstr);
+            compute_broadcast_strides(b, y, b_bstr);
+            if (has_avx512())
+                mul_broadcast_avx512((const float*)a->data, (const float*)b->data,
+                    (float*)y->data, y->dims, a_bstr, b_bstr, y->ndim);
+            else
+                mul_broadcast_avx2((const float*)a->data, (const float*)b->data,
+                    (float*)y->data, y->dims, a_bstr, b_bstr, y->ndim);
             return true;
         }
 #elifdef NNR_ARCH_ARM64
@@ -412,9 +467,27 @@ struct Div_op : public binary_arith_op_t<Div_op,
 #ifdef NNR_ARCH_X64
         if (a->type == NNR_DATA_TYPE_FLOAT32
             && a->ndata == b->ndata && a->ndata == y->ndata && a->ndata > 1024) {
-            div_avx512((const float*)a->data, (const float*)b->data,
-                       (float*)y->data, y->ndata);
+            if (has_avx512())
+                div_avx512((const float*)a->data, (const float*)b->data,
+                           (float*)y->data, y->ndata);
+            else
+                div_avx2((const float*)a->data, (const float*)b->data,
+                         (float*)y->data, y->ndata);
             y->format = a->format;
+            return true;
+        }
+        if (a->type == NNR_DATA_TYPE_FLOAT32 && y->type == NNR_DATA_TYPE_FLOAT32
+            && a->type == b->type && y->ndata > 1024 && y->ndim > 0
+            && y->ndim <= MAX_NDIM) {
+            int a_bstr[MAX_NDIM], b_bstr[MAX_NDIM];
+            compute_broadcast_strides(a, y, a_bstr);
+            compute_broadcast_strides(b, y, b_bstr);
+            if (has_avx512())
+                div_broadcast_avx512((const float*)a->data, (const float*)b->data,
+                    (float*)y->data, y->dims, a_bstr, b_bstr, y->ndim);
+            else
+                div_broadcast_avx2((const float*)a->data, (const float*)b->data,
+                    (float*)y->data, y->dims, a_bstr, b_bstr, y->ndim);
             return true;
         }
 #endif

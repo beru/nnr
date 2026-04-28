@@ -438,8 +438,12 @@ static tensor_t* tensor_from_value_info(const onnx_pb::ValueInfoProto& v)
     if (v.type.tensor_type.elem_type != 0) {
         data_type_t type = onnx_to_nnr_dtype(v.type.tensor_type.elem_type);
         small_vector<int> dims;
+        // Symbolic / unspecified dims (dim_param or no dim_value) load as 0.
+        // Bench harness's -d N path and user code rely on 0 as the
+        // "needs concrete value" sentinel (see tests/bench/bench.cpp -d loop).
+        // Defaulting to 1 silently runs models at degenerate spatial sizes.
         for (auto& d : v.type.tensor_type.shape.dim)
-            dims.push_back(d.dim_value > 0 ? (int)d.dim_value : 1);
+            dims.push_back(d.dim_value > 0 ? (int)d.dim_value : 0);
         return new (std::nothrow) tensor_t(v.name, type, dims);
     }
     if (v.type.sequence_type)

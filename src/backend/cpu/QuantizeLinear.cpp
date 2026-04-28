@@ -136,7 +136,7 @@ struct QuantizeLinear_operator : public operator_t {
                 uint8_t* py = (uint8_t*)y->data;
                 size_t total = x->ndata;
 #ifdef NNR_ARCH_X64
-                if (has_avx512() && total >= 64) {
+                if (total >= 64 && (has_avx512() || detect_isa() >= isa_t::avx2)) {
                     float inv_scale = 1.0f / scale;
                     // ORT-style cost-based threading: float→uint8 = 4B in, 1B out, 3 compute
                     int nt = nnr::elementwise_threads(total, 4, 1, 3);
@@ -145,21 +145,43 @@ struct QuantizeLinear_operator : public operator_t {
                     nnr::for_dynamic(0, nblocks, nt, [&](int /*tid*/, int blk) {
                         size_t base = (size_t)blk * BLOCK;
                         size_t end = std::min(base + BLOCK, total);
-                        __m512 vis = _mm512_set1_ps(inv_scale);
-                        __m512 vzp = _mm512_set1_ps((float)zero);
-                        __m512 vmin = _mm512_setzero_ps();
-                        __m512 vmax = _mm512_set1_ps(255.0f);
-                        size_t i = base;
-                        for (; i + 16 <= end; i += 16) {
-                            __m512 v = _mm512_loadu_ps(px + i);
-                            v = _mm512_add_ps(_mm512_roundscale_ps(
-                                _mm512_mul_ps(v, vis), _MM_FROUND_TO_NEAREST_INT), vzp);
-                            v = _mm512_max_ps(_mm512_min_ps(v, vmax), vmin);
-                            _mm_storeu_si128((__m128i*)(py + i),
-                                _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v)));
+                        if (has_avx512()) {
+                            __m512 vis = _mm512_set1_ps(inv_scale);
+                            __m512 vzp = _mm512_set1_ps((float)zero);
+                            __m512 vmin = _mm512_setzero_ps();
+                            __m512 vmax = _mm512_set1_ps(255.0f);
+                            size_t i = base;
+                            for (; i + 16 <= end; i += 16) {
+                                __m512 v = _mm512_loadu_ps(px + i);
+                                v = _mm512_add_ps(_mm512_roundscale_ps(
+                                    _mm512_mul_ps(v, vis), _MM_FROUND_TO_NEAREST_INT), vzp);
+                                v = _mm512_max_ps(_mm512_min_ps(v, vmax), vmin);
+                                _mm_storeu_si128((__m128i*)(py + i),
+                                    _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v)));
+                            }
+                            for (; i < end; i++)
+                                py[i] = (uint8_t)std::clamp((int)std::nearbyint(px[i] / scale) + zero, 0, 255);
+                        } else {
+                            __m256 vis = _mm256_set1_ps(inv_scale);
+                            __m256 vzp = _mm256_set1_ps((float)zero);
+                            __m256 vmin = _mm256_setzero_ps();
+                            __m256 vmax = _mm256_set1_ps(255.0f);
+                            size_t i = base;
+                            for (; i + 8 <= end; i += 8) {
+                                __m256 v = _mm256_loadu_ps(px + i);
+                                v = _mm256_add_ps(_mm256_round_ps(
+                                    _mm256_mul_ps(v, vis), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), vzp);
+                                v = _mm256_max_ps(_mm256_min_ps(v, vmax), vmin);
+                                __m256i iv = _mm256_cvtps_epi32(v);
+                                __m128i lo = _mm256_castsi256_si128(iv);
+                                __m128i hi = _mm256_extracti128_si256(iv, 1);
+                                __m128i u16 = _mm_packus_epi32(lo, hi);
+                                __m128i u8  = _mm_packus_epi16(u16, u16);
+                                _mm_storel_epi64((__m128i*)(py + i), u8);
+                            }
+                            for (; i < end; i++)
+                                py[i] = (uint8_t)std::clamp((int)std::nearbyint(px[i] / scale) + zero, 0, 255);
                         }
-                        for (; i < end; i++)
-                            py[i] = (uint8_t)std::clamp((int)std::nearbyint(px[i] / scale) + zero, 0, 255);
                     });
                 } else
 #endif
@@ -170,7 +192,7 @@ struct QuantizeLinear_operator : public operator_t {
                 int8_t* py = (int8_t*)y->data;
                 size_t total = x->ndata;
 #ifdef NNR_ARCH_X64
-                if (has_avx512() && total >= 64) {
+                if (total >= 64 && (has_avx512() || detect_isa() >= isa_t::avx2)) {
                     float inv_scale = 1.0f / scale;
                     int nt = nnr::elementwise_threads(total, 4, 1, 3);
                     constexpr size_t BLOCK = 4096;
@@ -178,21 +200,43 @@ struct QuantizeLinear_operator : public operator_t {
                     nnr::for_dynamic(0, nblocks, nt, [&](int /*tid*/, int blk) {
                         size_t base = (size_t)blk * BLOCK;
                         size_t end = std::min(base + BLOCK, total);
-                        __m512 vis = _mm512_set1_ps(inv_scale);
-                        __m512 vzp = _mm512_set1_ps((float)zero);
-                        __m512 vmin = _mm512_set1_ps(-128.0f);
-                        __m512 vmax = _mm512_set1_ps(127.0f);
-                        size_t i = base;
-                        for (; i + 16 <= end; i += 16) {
-                            __m512 v = _mm512_loadu_ps(px + i);
-                            v = _mm512_add_ps(_mm512_roundscale_ps(
-                                _mm512_mul_ps(v, vis), _MM_FROUND_TO_NEAREST_INT), vzp);
-                            v = _mm512_max_ps(_mm512_min_ps(v, vmax), vmin);
-                            _mm_storeu_si128((__m128i*)(py + i),
-                                _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v)));
+                        if (has_avx512()) {
+                            __m512 vis = _mm512_set1_ps(inv_scale);
+                            __m512 vzp = _mm512_set1_ps((float)zero);
+                            __m512 vmin = _mm512_set1_ps(-128.0f);
+                            __m512 vmax = _mm512_set1_ps(127.0f);
+                            size_t i = base;
+                            for (; i + 16 <= end; i += 16) {
+                                __m512 v = _mm512_loadu_ps(px + i);
+                                v = _mm512_add_ps(_mm512_roundscale_ps(
+                                    _mm512_mul_ps(v, vis), _MM_FROUND_TO_NEAREST_INT), vzp);
+                                v = _mm512_max_ps(_mm512_min_ps(v, vmax), vmin);
+                                _mm_storeu_si128((__m128i*)(py + i),
+                                    _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v)));
+                            }
+                            for (; i < end; i++)
+                                py[i] = (int8_t)std::clamp((int)std::nearbyint(px[i] / scale) + zero, -128, 127);
+                        } else {
+                            __m256 vis = _mm256_set1_ps(inv_scale);
+                            __m256 vzp = _mm256_set1_ps((float)zero);
+                            __m256 vmin = _mm256_set1_ps(-128.0f);
+                            __m256 vmax = _mm256_set1_ps(127.0f);
+                            size_t i = base;
+                            for (; i + 8 <= end; i += 8) {
+                                __m256 v = _mm256_loadu_ps(px + i);
+                                v = _mm256_add_ps(_mm256_round_ps(
+                                    _mm256_mul_ps(v, vis), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), vzp);
+                                v = _mm256_max_ps(_mm256_min_ps(v, vmax), vmin);
+                                __m256i iv = _mm256_cvtps_epi32(v);
+                                __m128i lo = _mm256_castsi256_si128(iv);
+                                __m128i hi = _mm256_extracti128_si256(iv, 1);
+                                __m128i s16 = _mm_packs_epi32(lo, hi);
+                                __m128i s8  = _mm_packs_epi16(s16, s16);
+                                _mm_storel_epi64((__m128i*)(py + i), s8);
+                            }
+                            for (; i < end; i++)
+                                py[i] = (int8_t)std::clamp((int)std::nearbyint(px[i] / scale) + zero, -128, 127);
                         }
-                        for (; i < end; i++)
-                            py[i] = (int8_t)std::clamp((int)std::nearbyint(px[i] / scale) + zero, -128, 127);
                     });
                 } else
 #endif

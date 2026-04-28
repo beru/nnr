@@ -120,8 +120,12 @@ struct LayerNormalization_operator : public operator_t {
 
             float eps = epsilon;
             nnr::for_static(0, outer, outer > 4, [&](int o) {
-                layer_norm_row_avx512(px + (size_t)o * inner,
-                    py + (size_t)o * inner, ps, pb, inner, eps);
+                if (has_avx512())
+                    layer_norm_row_avx512(px + (size_t)o * inner,
+                        py + (size_t)o * inner, ps, pb, inner, eps);
+                else
+                    layer_norm_row_avx2  (px + (size_t)o * inner,
+                        py + (size_t)o * inner, ps, pb, inner, eps);
             });
             return true;
         }

@@ -81,7 +81,7 @@ struct QLinearConcat_operator : public operator_t {
                                  int clamp_min, int clamp_max) {
         size_t i = 0;
 #if defined(NNR_ARCH_X64)
-        if (count >= 16) {
+        if (count >= 16 && has_avx512()) {
             __m512 vrs = _mm512_set1_ps(rs);
             __m512 vzp_x = _mm512_set1_ps((float)x_zp);
             __m512 vzp_y = _mm512_set1_ps((float)y_zp);
@@ -95,11 +95,10 @@ struct QLinearConcat_operator : public operator_t {
                 else
                     xi = _mm512_cvtepi8_epi32(raw);
                 __m512 xf = _mm512_cvtepi32_ps(xi);
-                // rs * (x - x_zp) + y_zp
                 __m512 val = _mm512_fmadd_ps(vrs, _mm512_sub_ps(xf, vzp_x), vzp_y);
                 val = _mm512_max_ps(val, vmin);
                 val = _mm512_min_ps(val, vmax);
-                __m512i ri = _mm512_cvtps_epi32(val); // round to nearest (default rounding)
+                __m512i ri = _mm512_cvtps_epi32(val);
                 if constexpr (std::is_same_v<T, uint8_t>) {
                     __m128i packed = _mm512_cvtusepi32_epi8(ri);
                     _mm_storeu_si128((__m128i*)(dst + i), packed);
@@ -107,6 +106,36 @@ struct QLinearConcat_operator : public operator_t {
                     __m128i packed = _mm512_cvtsepi32_epi8(ri);
                     _mm_storeu_si128((__m128i*)(dst + i), packed);
                 }
+            }
+        } else if (count >= 8 && detect_isa() >= isa_t::avx2) {
+            __m256 vrs = _mm256_set1_ps(rs);
+            __m256 vzp_x = _mm256_set1_ps((float)x_zp);
+            __m256 vzp_y = _mm256_set1_ps((float)y_zp);
+            __m256 vmin = _mm256_set1_ps((float)clamp_min);
+            __m256 vmax = _mm256_set1_ps((float)clamp_max);
+            for (; i + 8 <= count; i += 8) {
+                __m128i raw = _mm_loadl_epi64((const __m128i*)(src + i));
+                __m256i xi;
+                if constexpr (std::is_same_v<T, uint8_t>)
+                    xi = _mm256_cvtepu8_epi32(raw);
+                else
+                    xi = _mm256_cvtepi8_epi32(raw);
+                __m256 xf = _mm256_cvtepi32_ps(xi);
+                __m256 val = _mm256_fmadd_ps(vrs, _mm256_sub_ps(xf, vzp_x), vzp_y);
+                val = _mm256_max_ps(val, vmin);
+                val = _mm256_min_ps(val, vmax);
+                __m256i ri = _mm256_cvtps_epi32(val);
+                __m128i lo = _mm256_castsi256_si128(ri);
+                __m128i hi = _mm256_extracti128_si256(ri, 1);
+                __m128i packed;
+                if constexpr (std::is_same_v<T, uint8_t>) {
+                    __m128i u16 = _mm_packus_epi32(lo, hi);
+                    packed = _mm_packus_epi16(u16, u16);
+                } else {
+                    __m128i s16 = _mm_packs_epi32(lo, hi);
+                    packed = _mm_packs_epi16(s16, s16);
+                }
+                _mm_storel_epi64((__m128i*)(dst + i), packed);
             }
         }
 #endif

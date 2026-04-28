@@ -204,7 +204,7 @@ void memory_planner_t::plan()
     // BLOCKED axis ≥ 2 splits a c-block across the spatial dim. NHWC axis=1
     // in the common (H>1 or W>1) case requires producer kernels to write
     // with the parent's wider C stride — separate architectural extension
-    // tracked in .claude/kb/nhwc_concat_strided.md.
+    // tracked in kb/nhwc_concat_strided.md.
     // Per-format×axis tally for Phase 1a contig alias firings, so we can see
     // which paths nullify Concat in real models. Phase 1b-strided handles only
     // NHWC axis=1 with H>1 or W>1; everything else lands here.
@@ -636,6 +636,28 @@ void memory_planner_t::release()
         t->concat_parent = nullptr;
         t->concat_offset = 0;
         t->strides_set = false;
+    }
+    // Skip-aliased tensors (e.g. BN/Relu outputs fused into Conv) are not in
+    // lifetimes_ but still hold non-owning pointers into pool memory — set up
+    // by the SKIP handler in run_graph_impl, or by view ops at exec time.
+    // Without resetting them here, the subsequent pool free leaves their
+    // `data` dangling. fold_run's second-run pass then walks those tensors
+    // (e.g. MaxPool reading the fused Conv's relu output) and crashes.
+    // Guard on pool_ — when release() is called a second time (~planner via
+    // ~context_t after context's explicit pre-clean), the map's tensor_t
+    // objects have already been deleted; the pool is also empty so this work
+    // would be a no-op anyway.
+    if (ctx_ && !pool_.empty()) {
+        for (auto& [k, t] : ctx_->map) {
+            if (t && !t->owns_data) {
+                t->data = nullptr;
+                t->ndata = 0;
+                t->owns_data = true;
+                t->concat_parent = nullptr;
+                t->concat_offset = 0;
+                t->strides_set = false;
+            }
+        }
     }
 
     for (auto* p : pool_)

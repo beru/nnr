@@ -400,7 +400,14 @@ bool tensor_t::apply(const tensor_t& t)
 bool tensor_t::reshape(std::span<const int> dims, data_type_t type)
 {
     const int ndim = static_cast<int>(dims.size());
-    if ((this->ndim != ndim) || (!dims.empty() && (memcmp(&this->dims[0], dims.data(), sizeof(int) * ndim) != 0)) || (this->type != type)) {
+    // After invalidate_shapes()+planner.release(), non-owning tensors keep
+    // their dims but ndata is reset to 0; reinit must fire so ndata gets
+    // repopulated and memory_planner.analyze() sees the tensor as live.
+    bool match = (this->ndim == ndim)
+              && (dims.empty() || (memcmp(&this->dims[0], dims.data(), sizeof(int) * ndim) == 0))
+              && (this->type == type)
+              && (this->ndata > 0 || ndim == 0);
+    if (!match) {
         if (!reinit(type, dims)) return false;
     }
     return true;
@@ -409,7 +416,11 @@ bool tensor_t::reshape(std::span<const int> dims, data_type_t type)
 bool tensor_t::reshape_identity(const tensor_t* x, data_type_t type)
 {
     if (x->ndim > 0 || x->ndata > 0) {
-        if ((this->ndim != x->ndim) || (memcmp(this->dims, x->dims, sizeof(int) * this->ndim) != 0) || (this->type != type)) {
+        bool match = (this->ndim == x->ndim)
+                  && (memcmp(this->dims, x->dims, sizeof(int) * this->ndim) == 0)
+                  && (this->type == type)
+                  && (this->ndata > 0 || this->ndim == 0);
+        if (!match) {
             if (!reinit(type, x->dim_span())) return false;
         }
     }
@@ -442,7 +453,11 @@ bool tensor_t::reshape_multi_broadcast(const tensor_t* a, const tensor_t* b, dat
             }
         }
     }
-    if ((this->type != type) || (this->ndim != ndim) || (memcmp(this->dims, dims.data(), sizeof(int) * ndim) != 0)) {
+    bool match = (this->type == type)
+              && (this->ndim == ndim)
+              && (memcmp(this->dims, dims.data(), sizeof(int) * ndim) == 0)
+              && (this->ndata > 0 || ndim == 0);
+    if (!match) {
         if (!reinit(type, dims)) return false;
     }
     return true;
@@ -1648,8 +1663,33 @@ static bool fold_run(context_t* ctx)
     };
 
     for (auto* n : nodes) {
-        // Skip fused/folded/inactive nodes — their inputs may be invalid
-        if (n->skip || n->folded) continue;
+        // Folded nodes' outputs hold constant data — leave them alone.
+        if (n->folded) continue;
+        // Skip nodes have their data aliased to inputs[0] at runtime by
+        // run_graph_impl's SKIP handler, which copies `data` and `format`
+        // but NOT `dims`. Two scenarios where that matters at fold_run time:
+        //   (1) Preprocess marks some nodes skip BEFORE fold_run runs.
+        //       Their output tensors come from the ONNX loader with
+        //       dims-only (ndata=0); without an explicit reshape here, the
+        //       buffer is never allocated and downstream consumers (e.g.
+        //       prune_segments' trial-run) read garbage. This was the
+        //       super_resolution_10 + AUTO scroll first-run crash.
+        //   (2) Shape reruns (invalidate_shapes + run): producer reshape
+        //       updates Conv output to new dims, but the skip chain after
+        //       it stays at the old dims. Downstream MaxPool/Conv compute
+        //       output shape from the stale dims and the chain breaks.
+        //       This was the resnet18_v1 1→2 [1,1000]→[2,1000] propagation.
+        // Either way, mirror the SKIP handler's intent at fold_run time
+        // by calling the standard reshape path on the output.
+        if (n->skip) {
+            if (!n->inputs.empty() && !n->outputs.empty()
+                && n->inputs[0] && n->outputs[0]) {
+                auto* x = n->inputs[0];
+                auto* y = n->outputs[0];
+                y->reshape(x->dim_span(), x->type);
+            }
+            continue;
+        }
 
         // Mirror CUDA's "no GPU during fold_run" gate
         // (cuda_backend.cpp:14-21): GPU exec writes only to device memory,
@@ -1857,10 +1897,27 @@ bool context_t::run()
     // Dynamic shape change: re-run fold_run to reshape all nodes and
     // re-execute folded ops (Shape, Gather, etc.) that produce shape data.
     if (shapes_changed) {
+        // After invalidate_shapes()+release(), planned activations have
+        // owns_data=true, data=null, ndata=0 — but their `format` flag
+        // (BLOCKED_16 / NHWC) is preserved from the first run. fold_run
+        // re-allocates them as plain NCHW heap buffers and runs cheap ops
+        // against them; if format still says BLOCKED_16, MaxPool / Pool /
+        // ResizeKern dispatch to layout-specific kernels that read the
+        // wrong stride and crash. Reset to NCHW now so fold_run sees a
+        // consistent layout. build_plan → reset_formats() will restore the
+        // BLOCKED_16/NHWC bits before run_graph_impl executes.
+        optimizer->reset_formats_to_nchw();
         shapes_dirty = true; // fold_run checks this
         if (!fold_run(this))
             return false;
         shapes_dirty = false;
+        // Re-derive SCHEDULING-level state (scroll segments, strip heights,
+        // plan, exec_steps) against the new shapes. PREPROCESS / FUSION /
+        // LAYOUT stay committed — channel counts and op structure must be
+        // stable across reinit() (see invalidate_shapes() docs).
+        optimizer->rerun_after_shape_change(this);
+        if (optimizer->layout_reorder_ws > workspace_size)
+            ensure_workspace(this, optimizer->layout_reorder_ws);
         // Re-apply memory plan with new sizes
         if (memory_planning_enabled) {
             planner.analyze(this);

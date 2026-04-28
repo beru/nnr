@@ -35,15 +35,25 @@ struct ReduceSum_operator : reduce_base_t {
                 if (tail == 1) {
                     // Reduce contiguous elements: vectorized horizontal sum
                     nnr::for_static(0, batch, batch > 4, [&](int b) {
-                        py[b] = reduce_sum_avx512(px + (size_t)b * red, red);
+                        if (has_avx512())
+                            py[b] = reduce_sum_avx512(px + (size_t)b * red, red);
+                        else
+                            py[b] = reduce_sum_avx2  (px + (size_t)b * red, red);
                     });
-                } else if (tail >= 16) {
+                } else if (tail >= 8) {
                     // Vectorize over tail dimension, reduce sequentially
                     nnr::for_static(0, batch, batch > 4, [&](int b) {
-                        reduce_sum_tail_avx512(
-                            py + (size_t)b * tail,
-                            px + (size_t)b * red * tail,
-                            red, tail);
+                        if (has_avx512() && tail >= 16) {
+                            reduce_sum_tail_avx512(
+                                py + (size_t)b * tail,
+                                px + (size_t)b * red * tail,
+                                red, tail);
+                        } else {
+                            reduce_sum_tail_avx2(
+                                py + (size_t)b * tail,
+                                px + (size_t)b * red * tail,
+                                red, tail);
+                        }
                     });
                 } else {
                     // Small tail: scalar with threading over batch*tail.

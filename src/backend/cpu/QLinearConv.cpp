@@ -1622,12 +1622,16 @@ struct QLinearConv_operator : public operator_t {
         if (!init_qlinear4d_vars<T>(v)) return false;
 
 #ifdef NNR_ARCH_X64
-        if (exec_dw_int8_nhwc<T>(v))  return true;
-        if (exec_first_layer_int8<T>(v)) return true;
-        if (exec_direct_int8<T>(v))   return true;
-        if (exec_packed_nr48<T>(v))   return true;
-        if (exec_gather_gemm<T>(v))   return true;
-        if (exec_vnni_im2col<T>(v))   return true;
+        // All x64 int8 conv specializations require AVX-512+VNNI (VPDPBUSD).
+        // Without it, dispatch falls through to the float dequant fallback.
+        if (has_avx512()) {
+            if (exec_dw_int8_nhwc<T>(v))  return true;
+            if (exec_first_layer_int8<T>(v)) return true;
+            if (exec_direct_int8<T>(v))   return true;
+            if (exec_packed_nr48<T>(v))   return true;
+            if (exec_gather_gemm<T>(v))   return true;
+            if (exec_vnni_im2col<T>(v))   return true;
+        }
 #elifdef NNR_ARCH_ARM64
         if (exec_dw_int8_nhwc_neon<T>(v))    return true;
         if (exec_direct_int8_nhwc_neon<T>(v)) return true;

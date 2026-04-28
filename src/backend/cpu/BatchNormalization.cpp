@@ -163,9 +163,15 @@ struct BatchNormalization_operator : public operator_t {
                 const int ldc = make_addr(y).elem_stride<T>(3);
                 if constexpr (std::is_same_v<T, float>) {
 #ifdef NNR_ARCH_X64
-                    for (int s = 0; s < spatial; ++s)
-                        channel_affine_avx512((float*)py + (size_t)s * ldc,
-                            (const float*)px + (size_t)s * C, ch_alpha, ch_beta, C);
+                    if (has_avx512()) {
+                        for (int s = 0; s < spatial; ++s)
+                            channel_affine_avx512((float*)py + (size_t)s * ldc,
+                                (const float*)px + (size_t)s * C, ch_alpha, ch_beta, C);
+                    } else {
+                        for (int s = 0; s < spatial; ++s)
+                            channel_affine_avx2((float*)py + (size_t)s * ldc,
+                                (const float*)px + (size_t)s * C, ch_alpha, ch_beta, C);
+                    }
 #elifdef NNR_ARCH_ARM64
                     {
                         for (int s = 0; s < spatial; ++s)
@@ -206,10 +212,17 @@ struct BatchNormalization_operator : public operator_t {
                     T* dst = py + o;
 #ifdef NNR_ARCH_X64
                     if constexpr (std::is_same_v<T, float>) {
-                        if (fuse_relu)
-                            affine_relu_avx512((float*)dst, (const float*)src, channel, a, b);
-                        else
-                            affine_avx512((float*)dst, (const float*)src, channel, a, b);
+                        if (fuse_relu) {
+                            if (has_avx512())
+                                affine_relu_avx512((float*)dst, (const float*)src, channel, a, b);
+                            else
+                                affine_relu_avx2  ((float*)dst, (const float*)src, channel, a, b);
+                        } else {
+                            if (has_avx512())
+                                affine_avx512((float*)dst, (const float*)src, channel, a, b);
+                            else
+                                affine_avx2  ((float*)dst, (const float*)src, channel, a, b);
+                        }
                     } else
 #elifdef NNR_ARCH_ARM64
                     if constexpr (std::is_same_v<T, float>) {
@@ -270,7 +283,8 @@ struct BatchNormalization_operator : public operator_t {
         int elem_count = row_count * W;
         auto bn_strip = [](const float* src, float* dst, int n, float a, float b) {
 #ifdef NNR_ARCH_X64
-            affine_avx512(dst, src, n, a, b);
+            if (has_avx512()) affine_avx512(dst, src, n, a, b);
+            else              affine_avx2  (dst, src, n, a, b);
 #elifdef NNR_ARCH_ARM64
             neon::affine_broadcast(src, dst, n, a, b);
 #else
@@ -311,7 +325,8 @@ struct BatchNormalization_operator : public operator_t {
                 const uint8_t* src = px + (size_t)p * (size_t)C;
                 uint8_t* dst = py + (size_t)p * (size_t)C;
 #ifdef NNR_ARCH_X64
-                channel_affine_u8_avx512(dst, src, A, B, C);
+                if (has_avx512()) channel_affine_u8_avx512(dst, src, A, B, C);
+                else              channel_affine_u8_avx2  (dst, src, A, B, C);
 #else
                 for (int c = 0; c < C; c++) {
                     float v = A[c] * (float)src[c] + B[c];
@@ -333,19 +348,39 @@ struct BatchNormalization_operator : public operator_t {
             uint8_t* dst = py + (size_t)nc * HW;
             int i = 0;
 #ifdef NNR_ARCH_X64
-            __m512 va = _mm512_set1_ps(a);
-            __m512 vb = _mm512_set1_ps(b);
-            __m512 v0 = _mm512_setzero_ps();
-            __m512 v255 = _mm512_set1_ps(255.0f);
-            for (; i + 16 <= HW; i += 16) {
-                __m128i xu8 = _mm_loadu_si128((const __m128i*)(src + i));
-                __m512i xi32 = _mm512_cvtepu8_epi32(xu8);
-                __m512 xf = _mm512_cvtepi32_ps(xi32);
-                xf = _mm512_fmadd_ps(xf, va, vb);
-                xf = _mm512_max_ps(_mm512_min_ps(xf, v255), v0);
-                __m512i yi32 = _mm512_cvtps_epi32(xf);
-                _mm_storeu_si128((__m128i*)(dst + i),
-                    _mm512_cvtusepi32_epi8(yi32));
+            if (has_avx512()) {
+                __m512 va = _mm512_set1_ps(a);
+                __m512 vb = _mm512_set1_ps(b);
+                __m512 v0 = _mm512_setzero_ps();
+                __m512 v255 = _mm512_set1_ps(255.0f);
+                for (; i + 16 <= HW; i += 16) {
+                    __m128i xu8 = _mm_loadu_si128((const __m128i*)(src + i));
+                    __m512i xi32 = _mm512_cvtepu8_epi32(xu8);
+                    __m512 xf = _mm512_cvtepi32_ps(xi32);
+                    xf = _mm512_fmadd_ps(xf, va, vb);
+                    xf = _mm512_max_ps(_mm512_min_ps(xf, v255), v0);
+                    __m512i yi32 = _mm512_cvtps_epi32(xf);
+                    _mm_storeu_si128((__m128i*)(dst + i),
+                        _mm512_cvtusepi32_epi8(yi32));
+                }
+            } else {
+                __m256 va = _mm256_set1_ps(a);
+                __m256 vb = _mm256_set1_ps(b);
+                __m256 v0 = _mm256_setzero_ps();
+                __m256 v255 = _mm256_set1_ps(255.0f);
+                for (; i + 8 <= HW; i += 8) {
+                    __m128i xu8 = _mm_loadl_epi64((const __m128i*)(src + i));
+                    __m256i xi32 = _mm256_cvtepu8_epi32(xu8);
+                    __m256 xf = _mm256_cvtepi32_ps(xi32);
+                    xf = _mm256_fmadd_ps(xf, va, vb);
+                    xf = _mm256_max_ps(_mm256_min_ps(xf, v255), v0);
+                    __m256i yi32 = _mm256_cvtps_epi32(xf);
+                    __m128i lo = _mm256_castsi256_si128(yi32);
+                    __m128i hi = _mm256_extracti128_si256(yi32, 1);
+                    __m128i u16 = _mm_packus_epi32(lo, hi);
+                    __m128i u8  = _mm_packus_epi16(u16, u16);
+                    _mm_storel_epi64((__m128i*)(dst + i), u8);
+                }
             }
 #endif
             for (; i < HW; i++) {
@@ -378,7 +413,8 @@ struct BatchNormalization_operator : public operator_t {
                 const float* src = px + (size_t)p * (size_t)C;
                 uint8_t* dst = py + (size_t)p * (size_t)C;
 #ifdef NNR_ARCH_X64
-                channel_affine_f32_u8_avx512(dst, src, A, B, C);
+                if (has_avx512()) channel_affine_f32_u8_avx512(dst, src, A, B, C);
+                else              channel_affine_f32_u8_avx2  (dst, src, A, B, C);
 #else
                 for (int c = 0; c < C; c++) {
                     float v = src[c] * A[c] + B[c];
@@ -399,17 +435,35 @@ struct BatchNormalization_operator : public operator_t {
             uint8_t* dst = py + (size_t)nc * HW;
             int i = 0;
 #ifdef NNR_ARCH_X64
-            __m512 va = _mm512_set1_ps(a);
-            __m512 vb = _mm512_set1_ps(b);
-            __m512 v0 = _mm512_setzero_ps();
-            __m512 v255 = _mm512_set1_ps(255.0f);
-            for (; i + 16 <= HW; i += 16) {
-                __m512 xf = _mm512_loadu_ps(src + i);
-                xf = _mm512_fmadd_ps(xf, va, vb);
-                xf = _mm512_max_ps(_mm512_min_ps(xf, v255), v0);
-                __m512i yi32 = _mm512_cvtps_epi32(xf);
-                _mm_storeu_si128((__m128i*)(dst + i),
-                    _mm512_cvtusepi32_epi8(yi32));
+            if (has_avx512()) {
+                __m512 va = _mm512_set1_ps(a);
+                __m512 vb = _mm512_set1_ps(b);
+                __m512 v0 = _mm512_setzero_ps();
+                __m512 v255 = _mm512_set1_ps(255.0f);
+                for (; i + 16 <= HW; i += 16) {
+                    __m512 xf = _mm512_loadu_ps(src + i);
+                    xf = _mm512_fmadd_ps(xf, va, vb);
+                    xf = _mm512_max_ps(_mm512_min_ps(xf, v255), v0);
+                    __m512i yi32 = _mm512_cvtps_epi32(xf);
+                    _mm_storeu_si128((__m128i*)(dst + i),
+                        _mm512_cvtusepi32_epi8(yi32));
+                }
+            } else {
+                __m256 va = _mm256_set1_ps(a);
+                __m256 vb = _mm256_set1_ps(b);
+                __m256 v0 = _mm256_setzero_ps();
+                __m256 v255 = _mm256_set1_ps(255.0f);
+                for (; i + 8 <= HW; i += 8) {
+                    __m256 xf = _mm256_loadu_ps(src + i);
+                    xf = _mm256_fmadd_ps(xf, va, vb);
+                    xf = _mm256_max_ps(_mm256_min_ps(xf, v255), v0);
+                    __m256i yi32 = _mm256_cvtps_epi32(xf);
+                    __m128i lo = _mm256_castsi256_si128(yi32);
+                    __m128i hi = _mm256_extracti128_si256(yi32, 1);
+                    __m128i u16 = _mm_packus_epi32(lo, hi);
+                    __m128i u8  = _mm_packus_epi16(u16, u16);
+                    _mm_storel_epi64((__m128i*)(dst + i), u8);
+                }
             }
 #endif
             for (; i < HW; i++) {

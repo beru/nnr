@@ -592,7 +592,15 @@ struct context_t {
 
     // Call after reinit()'ing graph input tensors to new shapes.
     // Marks shapes dirty and forces the next run()/prepare() to
-    // re-reshape all intermediate tensors.
+    // re-reshape all intermediate tensors, re-derive scroll segments,
+    // and re-apply the memory plan.
+    //
+    // Constraint: channel counts and graph topology must be stable across
+    // reinit(). Only batch and spatial dims (or NLP seq_len) may change.
+    // The LAYOUT-level optimizer passes (assign_blocked_layouts,
+    // assign_layouts, insert_reorders) commit graph mutations on the first
+    // run and are not re-run; their decisions are tied to channel counts.
+    // Changing channel counts requires reloading the model.
     void invalidate_shapes();
 
     // Thread count: default = physical cores (hardware_concurrency / smt_stride).

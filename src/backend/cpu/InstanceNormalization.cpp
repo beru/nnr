@@ -58,7 +58,8 @@ struct InstanceNormalization_operator : public operator_t {
             const float* src = px + (size_t)j * spatial;
             float mean, var;
 #ifdef NNR_ARCH_X64
-            compute_mean_var_avx512(src, spatial, mean, var);
+            if (has_avx512()) compute_mean_var_avx512(src, spatial, mean, var);
+            else              compute_mean_var_avx2  (src, spatial, mean, var);
 #elifdef NNR_ARCH_ARM64
             compute_mean_var_neon(src, spatial, mean, var);
 #else
@@ -98,7 +99,8 @@ struct InstanceNormalization_operator : public operator_t {
             float a = cached_alpha[nc];
             float b = cached_beta[nc];
 #ifdef NNR_ARCH_X64
-            affine_avx512(dst, src, count, a, b);
+            if (has_avx512()) affine_avx512(dst, src, count, a, b);
+            else              affine_avx2  (dst, src, count, a, b);
 #elifdef NNR_ARCH_ARM64
             affine_neon(dst, src, count, a, b);
 #else
@@ -132,7 +134,8 @@ struct InstanceNormalization_operator : public operator_t {
                 int jc = j % C;
                 float mean, var;
 #ifdef NNR_ARCH_X64
-                compute_mean_var_avx512(src, channel, mean, var);
+                if (has_avx512()) compute_mean_var_avx512(src, channel, mean, var);
+                else              compute_mean_var_avx2  (src, channel, mean, var);
 #else
                 compute_mean_var_neon(src, channel, mean, var);
 #endif
@@ -140,7 +143,8 @@ struct InstanceNormalization_operator : public operator_t {
                 float alpha = pscale[jc] / sqrtf(var + epsilon);
                 float b_shift = (float)pb[jc] - alpha * mean;
 #ifdef NNR_ARCH_X64
-                affine_avx512(dst, src, channel, alpha, b_shift);
+                if (has_avx512()) affine_avx512(dst, src, channel, alpha, b_shift);
+                else              affine_avx2  (dst, src, channel, alpha, b_shift);
 #else
                 affine_neon(dst, src, channel, alpha, b_shift);
 #endif

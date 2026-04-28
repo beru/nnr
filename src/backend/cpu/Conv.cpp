@@ -617,7 +617,8 @@ struct Conv_operator : public operator_t {
         int tensor_offset = 0)
     {
 #ifdef NNR_ARCH_X64
-        if (depthwise_strip_channel_avx512(xc, wc, yc, bv,
+        if (has_avx512()
+            && depthwise_strip_channel_avx512(xc, wc, yc, bv,
                 kH, kW, iH, iW, oW, sH, sW, dH, dW, pH, pW,
                 out_row_start, out_end, spatial_strip,
                 post_fn, fused_op, tensor_offset))

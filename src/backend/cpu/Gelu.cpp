@@ -5,6 +5,7 @@
 #include "thread_pool.h"
 #ifdef NNR_ARCH_X64
 #include "backend/x64/simd_math_avx512.h"
+#include "backend/x64/simd_math_avx2.h"
 #elifdef NNR_ARCH_ARM64
 #include "backend/arm/simd_math_neon.h"
 #endif
@@ -56,8 +57,12 @@ struct Gelu_operator : public operator_t {
     bool exec() override {
 #ifdef NNR_ARCH_X64
         if (inputs[0]->type == NNR_DATA_TYPE_FLOAT32 && !approximate) {
-            gelu_avx512((const float*)inputs[0]->data,
-                        (float*)outputs[0]->data, outputs[0]->ndata);
+            if (has_avx512())
+                gelu_avx512((const float*)inputs[0]->data,
+                            (float*)outputs[0]->data, outputs[0]->ndata);
+            else
+                gelu_avx2  ((const float*)inputs[0]->data,
+                            (float*)outputs[0]->data, outputs[0]->ndata);
             return true;
         }
 #elifdef NNR_ARCH_ARM64

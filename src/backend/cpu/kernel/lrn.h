@@ -11,6 +11,7 @@
 
 #ifdef NNR_ARCH_X64
 #include "backend/x64/lrn_avx512.h"
+#include "backend/x64/lrn_avx2.h"
 #elifdef NNR_ARCH_ARM64
 #include "backend/arm/lrn_neon.h"
 #endif
@@ -33,6 +34,15 @@ inline void lrn_channel(const float* __restrict input, float* __restrict output,
             lrn_channel_avx512(input, output, nc, C, spatial, c0, c1, alpha, bias, pow_neg_100{}, hw);
         else
             lrn_channel_avx512(input, output, nc, C, spatial, c0, c1, alpha, bias, pow_neg_general{beta}, hw);
+    } else if (detect_isa() >= isa_t::avx2) {
+        if (beta == 0.5f)
+            lrn_channel_avx2(input, output, nc, C, spatial, c0, c1, alpha, bias, pow_neg_050_avx2{}, hw);
+        else if (beta == 0.75f)
+            lrn_channel_avx2(input, output, nc, C, spatial, c0, c1, alpha, bias, pow_neg_075_avx2{}, hw);
+        else if (beta == 1.0f)
+            lrn_channel_avx2(input, output, nc, C, spatial, c0, c1, alpha, bias, pow_neg_100_avx2{}, hw);
+        else
+            lrn_channel_avx2(input, output, nc, C, spatial, c0, c1, alpha, bias, pow_neg_general_avx2{beta}, hw);
     }
 #elifdef NNR_ARCH_ARM64
     lrn_channel_neon(input, output, nc, C, spatial, c0, c1, alpha, beta, bias, hw);

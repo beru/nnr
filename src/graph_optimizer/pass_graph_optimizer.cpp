@@ -414,6 +414,13 @@ struct prune_segments_pass_t : pass_t {
     {
         if (opt.scroll_mode != scroll_mode_t::AUTO) return false;
         if (opt.scroll_segments.empty()) return false;
+        // Skip on shape-change rerun: prune_segments executes ops to time
+        // them, but the memory plan + activation buffers are mid-rebuild
+        // and ops can read uninitialized pool slots → crash. The
+        // first-run prune decision (which segments are profitable) holds
+        // for shape-stable reruns; only strip_height needs refresh, and
+        // that's done by detect_scroll_chains.
+        if (opt.scheduling_in_rerun) return false;
         opt.prune_segments(ctx);
         return false;  // idempotent; no cascade
     }
@@ -497,17 +504,53 @@ struct pass_graph_optimizer_t : graph_optimizer_t {
         // Run registered SCHEDULING passes (detect_scroll_chains, prune_segments).
         mgr_.run_level(pass_level_t::SCHEDULING, *this, ctx);
 
-        // Scroll state finalization — not a pass, just a state-machine reduction
-        // over scroll_mode and the post-pass scroll_segments vector.
+        resolve_scrolling();
+    }
+
+    void rerun_after_shape_change(context_t* ctx) override
+    {
+        if (!ctx || !ctx->graph) return;
+
+        // Reset SCHEDULING-level state. detect_scroll_chains gates on
+        // scroll_detection_done and clears scroll_segments on entry; clearing
+        // both here forces a re-derivation against the new shapes. plan +
+        // exec_steps must also be invalidated because they embed the
+        // strip_height / segment boundaries.
+        scroll_detection_done = false;
+        scrolling_resolved    = false;
+        scroll_segments.clear();
+        plan_scroll_seg.clear();
+        plan.clear();
+        exec_steps.clear();
+        plan_built            = false;
+
+        // Re-run SCHEDULING passes only. PREPROCESS / FUSION / LAYOUT stay
+        // committed (graph mutations: decompose, fuse_*, insert_reorders).
+        // Set scheduling_in_rerun so prune_segments skips its trial-run
+        // (buffers are mid-rebuild — see prune_segments_pass_t::apply).
+        scheduling_in_rerun = true;
+        mgr_.run_level(pass_level_t::SCHEDULING, *this, ctx);
+        scheduling_in_rerun = false;
+        resolve_scrolling();
+
+        // Rebuild plan + exec_steps from the new scroll segments.
+        build_plan(ctx);
+    }
+
+protected:
+    pass_manager_t mgr_;
+
+private:
+    // Scroll state finalization — not a pass, just a state-machine reduction
+    // over scroll_mode and the post-pass scroll_segments vector.
+    void resolve_scrolling()
+    {
         switch (scroll_mode) {
         case scroll_mode_t::AUTO: scrolling_resolved = !scroll_segments.empty(); break;
         case scroll_mode_t::ON:   scrolling_resolved = true;  break;
         case scroll_mode_t::OFF:  scrolling_resolved = false; break;
         }
     }
-
-protected:
-    pass_manager_t mgr_;
 };
 
 // ---------------------------------------------------------------------------

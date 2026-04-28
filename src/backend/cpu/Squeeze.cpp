@@ -47,9 +47,12 @@ struct Squeeze_1_11_operator : public operator_t {
 
     bool exec_impl() {
         tensor_t* y = outputs[0];
-        if (!y->owns_data)
+        // Self-reshape on view path: dynamic-shape producer (NMS/TopK/...)
+        // upstream may shrink x at exec time. See kb/dynamic_shape_pool_view.md.
+        if (!y->owns_data) {
+            if (!reshape()) return false;
             y->data = inputs[0]->data;  // zero-copy view
-        else if (y->data != inputs[0]->data)
+        } else if (y->data != inputs[0]->data)
             copy_data(y, inputs[0]);
         return true;
     }
@@ -130,9 +133,11 @@ struct Squeeze_13_operator : public operator_t {
 
     bool exec_impl() {
         tensor_t* y = outputs[0];
-        if (!y->owns_data)
+        // Self-reshape on view path. See kb/dynamic_shape_pool_view.md.
+        if (!y->owns_data) {
+            if (!reshape()) return false;
             y->data = inputs[0]->data;  // zero-copy view
-        else if (y->data != inputs[0]->data)
+        } else if (y->data != inputs[0]->data)
             copy_data(y, inputs[0]);
         return true;
     }

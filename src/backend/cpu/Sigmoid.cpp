@@ -3,6 +3,7 @@
 #include "thread_pool.h"
 #ifdef NNR_ARCH_X64
 #include "backend/x64/simd_math_avx512.h"
+#include "backend/x64/simd_math_avx2.h"
 #elifdef NNR_ARCH_ARM64
 #include "backend/arm/simd_math_neon.h"
 #endif
@@ -23,8 +24,13 @@ struct Sigmoid_operator : public operator_t {
             // strip, etc.); call the single-threaded `_kernel` variants to
             // avoid nested for_static deadlock.
 #ifdef NNR_ARCH_X64
-            if (fused_silu) silu_avx512_kernel(data, data, n);
-            else            sigmoid_avx512_kernel(data, n);
+            if (has_avx512()) {
+                if (fused_silu) silu_avx512_kernel(data, data, n);
+                else            sigmoid_avx512_kernel(data, n);
+            } else {
+                if (fused_silu) silu_avx2_kernel(data, data, n);
+                else            sigmoid_avx2_kernel(data, n);
+            }
 #else
             if (fused_silu) silu_neon_kernel(data, data, n);
             else            sigmoid_neon_kernel(data, n);
@@ -98,8 +104,13 @@ struct Sigmoid_operator : public operator_t {
                 float* dst = py + (size_t)nc * oH * W + (size_t)out_row_start * W;
                 if (src != dst) memcpy(dst, src, count * sizeof(float));
 #ifdef NNR_ARCH_X64
-                if (fused_silu_local) silu_avx512_kernel(dst, dst, count);
-                else                  sigmoid_avx512_kernel(dst, count);
+                if (has_avx512()) {
+                    if (fused_silu_local) silu_avx512_kernel(dst, dst, count);
+                    else                  sigmoid_avx512_kernel(dst, count);
+                } else {
+                    if (fused_silu_local) silu_avx2_kernel(dst, dst, count);
+                    else                  sigmoid_avx2_kernel(dst, count);
+                }
 #else // NNR_ARCH_ARM64
                 if (fused_silu_local) silu_neon_kernel(dst, dst, count);
                 else                  sigmoid_neon_kernel(dst, count);
@@ -127,11 +138,13 @@ struct Sigmoid_operator : public operator_t {
             tensor_t* y = outputs[0];
             const tensor_t* x = inputs[0];
             if (is_fused_silu) {
-                silu_avx512((const float*)x->data, (float*)y->data, x->ndata);
+                if (has_avx512()) silu_avx512((const float*)x->data, (float*)y->data, x->ndata);
+                else              silu_avx2  ((const float*)x->data, (float*)y->data, x->ndata);
             } else {
                 if (x->data != y->data)
                     memcpy(y->data, x->data, x->ndata * sizeof(float));
-                sigmoid_avx512((float*)y->data, y->ndata);
+                if (has_avx512()) sigmoid_avx512((float*)y->data, y->ndata);
+                else              sigmoid_avx2  ((float*)y->data, y->ndata);
             }
             return true;
 #elifdef NNR_ARCH_ARM64

@@ -44,6 +44,7 @@
 // reorders naturally at runtime (see nnr.cpp wants_blocked handling).
 #include "graph_optimizer/graph_optimizer_internal.h"
 #include "thread_pool.h"
+#include "cpu_features.h"
 
 namespace nnr {
 
@@ -75,6 +76,13 @@ void assign_blocked_layouts(context_t* ctx)
     // No native blocked layout for this build target — nothing to do.
     // (x86 without AVX-512, or non-x64/non-ARM64 builds.)
     if (NATIVE_BLOCKED_FMT == memory_layout_t::NCHW) return;
+
+#ifdef NNR_ARCH_X64
+    // BLOCKED_16 NCHWc kernels (Conv, Winograd, depthwise) are AVX-512 only.
+    // On AVX-2-only x64 hardware skip blocked layout entirely — the NCHW path
+    // dispatches AVX-2 GEMM/depthwise instead.
+    if (!has_avx512()) return;
+#endif
 
     const bool debug_layout = ctx->optimizer->debug_layout;
     const bool force_nchwc = ctx->optimizer->force_nchwc;

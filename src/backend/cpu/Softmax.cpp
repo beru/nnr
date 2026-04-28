@@ -3,6 +3,7 @@
 #include "thread_pool.h"
 #ifdef NNR_ARCH_X64
 #include "backend/x64/softmax_avx512.h"
+#include "backend/x64/softmax_avx2.h"
 #elifdef NNR_ARCH_ARM64
 #include "backend/arm/softmax_neon.h"
 #endif
@@ -74,8 +75,12 @@ struct Softmax_13_operator : public operator_t {
                 // overhead otherwise dominates the tiny per-row work.
                 int64_t cost_per_row = (int64_t)current * 50;
                 nnr::for_cost(0, outer, cost_per_row, [&](int i) {
-                    softmax_row_avx512(px + (size_t)i * current,
-                                       py + (size_t)i * current, current);
+                    if (has_avx512())
+                        softmax_row_avx512(px + (size_t)i * current,
+                                           py + (size_t)i * current, current);
+                    else
+                        softmax_row_avx2  (px + (size_t)i * current,
+                                           py + (size_t)i * current, current);
                 });
                 return true;
             }
@@ -192,8 +197,12 @@ struct Softmax_1_11_operator : public operator_t {
             // (inner==1 case) applies directly.
             int64_t cost_per_row = (int64_t)D * 50;
             nnr::for_cost(0, N, cost_per_row, [&](int i) {
-                softmax_row_avx512(px + (size_t)i * D,
-                                   py + (size_t)i * D, D);
+                if (has_avx512())
+                    softmax_row_avx512(px + (size_t)i * D,
+                                       py + (size_t)i * D, D);
+                else
+                    softmax_row_avx2  (px + (size_t)i * D,
+                                       py + (size_t)i * D, D);
             });
             return true;
         }

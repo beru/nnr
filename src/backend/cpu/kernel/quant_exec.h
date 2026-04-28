@@ -25,18 +25,36 @@ inline void dequantize_to_f32(float* __restrict dst, const void* __restrict src,
     if (type == NNR_DATA_TYPE_UINT8) {
         const uint8_t* p = (const uint8_t*)src;
 #ifdef NNR_ARCH_X64
-        __m512 vs = _mm512_set1_ps(scale);
-        __m512 vzp = _mm512_set1_ps((float)zp);
-        size_t i = 0;
-        for (; i + 16 <= n; i += 16) {
-            __m128i bytes = _mm_loadu_si128((const __m128i*)(p + i));
-            __m512i words = _mm512_cvtepu8_epi32(bytes);
-            __m512 fv = _mm512_cvtepi32_ps(words);
-            fv = _mm512_mul_ps(_mm512_sub_ps(fv, vzp), vs);
-            _mm512_storeu_ps(dst + i, fv);
+        if (has_avx512()) {
+            __m512 vs = _mm512_set1_ps(scale);
+            __m512 vzp = _mm512_set1_ps((float)zp);
+            size_t i = 0;
+            for (; i + 16 <= n; i += 16) {
+                __m128i bytes = _mm_loadu_si128((const __m128i*)(p + i));
+                __m512i words = _mm512_cvtepu8_epi32(bytes);
+                __m512 fv = _mm512_cvtepi32_ps(words);
+                fv = _mm512_mul_ps(_mm512_sub_ps(fv, vzp), vs);
+                _mm512_storeu_ps(dst + i, fv);
+            }
+            for (; i < n; i++)
+                dst[i] = ((float)p[i] - zp) * scale;
+        } else if (detect_isa() >= isa_t::avx2) {
+            __m256 vs = _mm256_set1_ps(scale);
+            __m256 vzp = _mm256_set1_ps((float)zp);
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                __m128i bytes = _mm_loadl_epi64((const __m128i*)(p + i));
+                __m256i words = _mm256_cvtepu8_epi32(bytes);
+                __m256 fv = _mm256_cvtepi32_ps(words);
+                fv = _mm256_mul_ps(_mm256_sub_ps(fv, vzp), vs);
+                _mm256_storeu_ps(dst + i, fv);
+            }
+            for (; i < n; i++)
+                dst[i] = ((float)p[i] - zp) * scale;
+        } else {
+            for (size_t i = 0; i < n; i++)
+                dst[i] = ((float)p[i] - zp) * scale;
         }
-        for (; i < n; i++)
-            dst[i] = ((float)p[i] - zp) * scale;
 #else
         for (size_t i = 0; i < n; i++)
             dst[i] = ((float)p[i] - zp) * scale;
@@ -44,18 +62,36 @@ inline void dequantize_to_f32(float* __restrict dst, const void* __restrict src,
     } else if (type == NNR_DATA_TYPE_INT8) {
         const int8_t* p = (const int8_t*)src;
 #ifdef NNR_ARCH_X64
-        __m512 vs = _mm512_set1_ps(scale);
-        __m512 vzp = _mm512_set1_ps((float)zp);
-        size_t i = 0;
-        for (; i + 16 <= n; i += 16) {
-            __m128i bytes = _mm_loadu_si128((const __m128i*)(p + i));
-            __m512i words = _mm512_cvtepi8_epi32(bytes);
-            __m512 fv = _mm512_cvtepi32_ps(words);
-            fv = _mm512_mul_ps(_mm512_sub_ps(fv, vzp), vs);
-            _mm512_storeu_ps(dst + i, fv);
+        if (has_avx512()) {
+            __m512 vs = _mm512_set1_ps(scale);
+            __m512 vzp = _mm512_set1_ps((float)zp);
+            size_t i = 0;
+            for (; i + 16 <= n; i += 16) {
+                __m128i bytes = _mm_loadu_si128((const __m128i*)(p + i));
+                __m512i words = _mm512_cvtepi8_epi32(bytes);
+                __m512 fv = _mm512_cvtepi32_ps(words);
+                fv = _mm512_mul_ps(_mm512_sub_ps(fv, vzp), vs);
+                _mm512_storeu_ps(dst + i, fv);
+            }
+            for (; i < n; i++)
+                dst[i] = ((float)p[i] - zp) * scale;
+        } else if (detect_isa() >= isa_t::avx2) {
+            __m256 vs = _mm256_set1_ps(scale);
+            __m256 vzp = _mm256_set1_ps((float)zp);
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                __m128i bytes = _mm_loadl_epi64((const __m128i*)(p + i));
+                __m256i words = _mm256_cvtepi8_epi32(bytes);
+                __m256 fv = _mm256_cvtepi32_ps(words);
+                fv = _mm256_mul_ps(_mm256_sub_ps(fv, vzp), vs);
+                _mm256_storeu_ps(dst + i, fv);
+            }
+            for (; i < n; i++)
+                dst[i] = ((float)p[i] - zp) * scale;
+        } else {
+            for (size_t i = 0; i < n; i++)
+                dst[i] = ((float)p[i] - zp) * scale;
         }
-        for (; i < n; i++)
-            dst[i] = ((float)p[i] - zp) * scale;
 #else
         for (size_t i = 0; i < n; i++)
             dst[i] = ((float)p[i] - zp) * scale;
@@ -80,24 +116,52 @@ inline void quantize_from_f32(void* __restrict dst, data_type_t type,
     if (type == NNR_DATA_TYPE_UINT8) {
         uint8_t* p = (uint8_t*)dst;
 #ifdef NNR_ARCH_X64
-        __m512 vis = _mm512_set1_ps(inv_scale);
-        __m512 vzp = _mm512_set1_ps((float)zp);
-        __m512 vmin = _mm512_set1_ps(0.0f);
-        __m512 vmax = _mm512_set1_ps(255.0f);
-        size_t i = 0;
-        for (; i + 16 <= n; i += 16) {
-            __m512 fv = _mm512_loadu_ps(src + i);
-            fv = _mm512_add_ps(_mm512_roundscale_ps(
-                _mm512_mul_ps(fv, vis), _MM_FROUND_TO_NEAREST_INT), vzp);
-            fv = _mm512_max_ps(_mm512_min_ps(fv, vmax), vmin);
-            __m512i iv = _mm512_cvtps_epi32(fv);
-            // Pack 32→8: extract low bytes
-            __m128i packed = _mm512_cvtepi32_epi8(iv);
-            _mm_storeu_si128((__m128i*)(p + i), packed);
-        }
-        for (; i < n; i++) {
-            int32_t v = (int32_t)std::nearbyint(src[i] * inv_scale) + zp;
-            p[i] = (uint8_t)std::clamp(v, 0, 255);
+        if (has_avx512()) {
+            __m512 vis = _mm512_set1_ps(inv_scale);
+            __m512 vzp = _mm512_set1_ps((float)zp);
+            __m512 vmin = _mm512_set1_ps(0.0f);
+            __m512 vmax = _mm512_set1_ps(255.0f);
+            size_t i = 0;
+            for (; i + 16 <= n; i += 16) {
+                __m512 fv = _mm512_loadu_ps(src + i);
+                fv = _mm512_add_ps(_mm512_roundscale_ps(
+                    _mm512_mul_ps(fv, vis), _MM_FROUND_TO_NEAREST_INT), vzp);
+                fv = _mm512_max_ps(_mm512_min_ps(fv, vmax), vmin);
+                __m512i iv = _mm512_cvtps_epi32(fv);
+                __m128i packed = _mm512_cvtepi32_epi8(iv);
+                _mm_storeu_si128((__m128i*)(p + i), packed);
+            }
+            for (; i < n; i++) {
+                int32_t v = (int32_t)std::nearbyint(src[i] * inv_scale) + zp;
+                p[i] = (uint8_t)std::clamp(v, 0, 255);
+            }
+        } else if (detect_isa() >= isa_t::avx2) {
+            __m256 vis = _mm256_set1_ps(inv_scale);
+            __m256 vzp = _mm256_set1_ps((float)zp);
+            __m256 vmin = _mm256_set1_ps(0.0f);
+            __m256 vmax = _mm256_set1_ps(255.0f);
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                __m256 fv = _mm256_loadu_ps(src + i);
+                fv = _mm256_add_ps(_mm256_round_ps(
+                    _mm256_mul_ps(fv, vis), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), vzp);
+                fv = _mm256_max_ps(_mm256_min_ps(fv, vmax), vmin);
+                __m256i iv = _mm256_cvtps_epi32(fv);
+                __m128i lo = _mm256_castsi256_si128(iv);
+                __m128i hi = _mm256_extracti128_si256(iv, 1);
+                __m128i u16 = _mm_packus_epi32(lo, hi);
+                __m128i u8  = _mm_packus_epi16(u16, u16);
+                _mm_storel_epi64((__m128i*)(p + i), u8);
+            }
+            for (; i < n; i++) {
+                int32_t v = (int32_t)std::nearbyint(src[i] * inv_scale) + zp;
+                p[i] = (uint8_t)std::clamp(v, 0, 255);
+            }
+        } else {
+            for (size_t i = 0; i < n; i++) {
+                int32_t v = (int32_t)std::nearbyint(src[i] * inv_scale) + zp;
+                p[i] = (uint8_t)std::clamp(v, 0, 255);
+            }
         }
 #else
         for (size_t i = 0; i < n; i++) {
@@ -108,23 +172,52 @@ inline void quantize_from_f32(void* __restrict dst, data_type_t type,
     } else if (type == NNR_DATA_TYPE_INT8) {
         int8_t* p = (int8_t*)dst;
 #ifdef NNR_ARCH_X64
-        __m512 vis = _mm512_set1_ps(inv_scale);
-        __m512 vzp = _mm512_set1_ps((float)zp);
-        __m512 vmin = _mm512_set1_ps(-128.0f);
-        __m512 vmax = _mm512_set1_ps(127.0f);
-        size_t i = 0;
-        for (; i + 16 <= n; i += 16) {
-            __m512 fv = _mm512_loadu_ps(src + i);
-            fv = _mm512_add_ps(_mm512_roundscale_ps(
-                _mm512_mul_ps(fv, vis), _MM_FROUND_TO_NEAREST_INT), vzp);
-            fv = _mm512_max_ps(_mm512_min_ps(fv, vmax), vmin);
-            __m512i iv = _mm512_cvtps_epi32(fv);
-            __m128i packed = _mm512_cvtepi32_epi8(iv);
-            _mm_storeu_si128((__m128i*)(p + i), packed);
-        }
-        for (; i < n; i++) {
-            int32_t v = (int32_t)std::nearbyint(src[i] * inv_scale) + zp;
-            p[i] = (int8_t)std::clamp(v, -128, 127);
+        if (has_avx512()) {
+            __m512 vis = _mm512_set1_ps(inv_scale);
+            __m512 vzp = _mm512_set1_ps((float)zp);
+            __m512 vmin = _mm512_set1_ps(-128.0f);
+            __m512 vmax = _mm512_set1_ps(127.0f);
+            size_t i = 0;
+            for (; i + 16 <= n; i += 16) {
+                __m512 fv = _mm512_loadu_ps(src + i);
+                fv = _mm512_add_ps(_mm512_roundscale_ps(
+                    _mm512_mul_ps(fv, vis), _MM_FROUND_TO_NEAREST_INT), vzp);
+                fv = _mm512_max_ps(_mm512_min_ps(fv, vmax), vmin);
+                __m512i iv = _mm512_cvtps_epi32(fv);
+                __m128i packed = _mm512_cvtepi32_epi8(iv);
+                _mm_storeu_si128((__m128i*)(p + i), packed);
+            }
+            for (; i < n; i++) {
+                int32_t v = (int32_t)std::nearbyint(src[i] * inv_scale) + zp;
+                p[i] = (int8_t)std::clamp(v, -128, 127);
+            }
+        } else if (detect_isa() >= isa_t::avx2) {
+            __m256 vis = _mm256_set1_ps(inv_scale);
+            __m256 vzp = _mm256_set1_ps((float)zp);
+            __m256 vmin = _mm256_set1_ps(-128.0f);
+            __m256 vmax = _mm256_set1_ps(127.0f);
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                __m256 fv = _mm256_loadu_ps(src + i);
+                fv = _mm256_add_ps(_mm256_round_ps(
+                    _mm256_mul_ps(fv, vis), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), vzp);
+                fv = _mm256_max_ps(_mm256_min_ps(fv, vmax), vmin);
+                __m256i iv = _mm256_cvtps_epi32(fv);
+                __m128i lo = _mm256_castsi256_si128(iv);
+                __m128i hi = _mm256_extracti128_si256(iv, 1);
+                __m128i s16 = _mm_packs_epi32(lo, hi);    // signed sat
+                __m128i s8  = _mm_packs_epi16(s16, s16);
+                _mm_storel_epi64((__m128i*)(p + i), s8);
+            }
+            for (; i < n; i++) {
+                int32_t v = (int32_t)std::nearbyint(src[i] * inv_scale) + zp;
+                p[i] = (int8_t)std::clamp(v, -128, 127);
+            }
+        } else {
+            for (size_t i = 0; i < n; i++) {
+                int32_t v = (int32_t)std::nearbyint(src[i] * inv_scale) + zp;
+                p[i] = (int8_t)std::clamp(v, -128, 127);
+            }
         }
 #else
         for (size_t i = 0; i < n; i++) {

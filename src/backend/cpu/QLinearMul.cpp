@@ -88,6 +88,47 @@ struct QLinearMul_operator : public operator_t {
                 }
                 return true;
             }
+            if (detect_isa() >= isa_t::avx2) {
+                __m256 vcs = _mm256_set1_ps(cs);
+                __m256 vazp = _mm256_set1_ps((float)a_zp);
+                __m256 vbzp = _mm256_set1_ps((float)b_zp);
+                __m256 vyzp = _mm256_set1_ps((float)y_zp);
+                __m256 vmin = _mm256_set1_ps((float)clamp_min);
+                __m256 vmax = _mm256_set1_ps((float)clamp_max);
+                size_t i = 0;
+                for (; i + 8 <= n; i += 8) {
+                    __m256 fa, fb;
+                    if constexpr (std::is_same_v<T, uint8_t>) {
+                        fa = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(pa + i))));
+                        fb = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(pb + i))));
+                    } else {
+                        fa = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(pa + i))));
+                        fb = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(pb + i))));
+                    }
+                    __m256 va = _mm256_sub_ps(fa, vazp);
+                    __m256 vb = _mm256_sub_ps(fb, vbzp);
+                    __m256 v = _mm256_fmadd_ps(_mm256_mul_ps(va, vb), vcs, vyzp);
+                    v = _mm256_round_ps(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    v = _mm256_max_ps(_mm256_min_ps(v, vmax), vmin);
+                    __m256i vi = _mm256_cvtps_epi32(v);
+                    __m128i lo = _mm256_castsi256_si128(vi);
+                    __m128i hi = _mm256_extracti128_si256(vi, 1);
+                    __m128i out;
+                    if constexpr (std::is_same_v<T, uint8_t>) {
+                        __m128i u16 = _mm_packus_epi32(lo, hi);
+                        out = _mm_packus_epi16(u16, u16);
+                    } else {
+                        __m128i s16 = _mm_packs_epi32(lo, hi);
+                        out = _mm_packs_epi16(s16, s16);
+                    }
+                    _mm_storel_epi64((__m128i*)(py + i), out);
+                }
+                for (; i < n; i++) {
+                    float val = cs * (float)((int32_t)pa[i] - a_zp) * (float)((int32_t)pb[i] - b_zp) + (float)y_zp;
+                    py[i] = (T)std::clamp((int32_t)std::nearbyint(val), clamp_min, clamp_max);
+                }
+                return true;
+            }
 #endif
             for (size_t i = 0; i < n; i++) {
                 float val = cs * (float)((int32_t)pa[i] - a_zp) * (float)((int32_t)pb[i] - b_zp) + (float)y_zp;
@@ -155,6 +196,37 @@ struct QLinearMul_operator : public operator_t {
                             _mm_storeu_si128((__m128i*)(dst + c),
                                 _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v)));
                         }
+                    } else if (detect_isa() >= isa_t::avx2) {
+                        __m256 vfzp = _mm256_set1_ps((float)full_zp);
+                        __m256 vyzp = _mm256_set1_ps((float)y_zp);
+                        __m256 vmin = _mm256_set1_ps((float)clamp_min);
+                        __m256 vmax = _mm256_set1_ps((float)clamp_max);
+                        for (; c + 8 <= C; c += 8) {
+                            __m256 fa;
+                            if constexpr (std::is_same_v<T, uint8_t>)
+                                fa = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+                                    _mm_loadl_epi64((const __m128i*)(src + c))));
+                            else
+                                fa = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                                    _mm_loadl_epi64((const __m128i*)(src + c))));
+                            __m256 vcv = _mm256_loadu_ps(ch_val + c);
+                            __m256 v = _mm256_fmadd_ps(
+                                _mm256_sub_ps(fa, vfzp), vcv, vyzp);
+                            v = _mm256_round_ps(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                            v = _mm256_max_ps(_mm256_min_ps(v, vmax), vmin);
+                            __m256i vi = _mm256_cvtps_epi32(v);
+                            __m128i lo = _mm256_castsi256_si128(vi);
+                            __m128i hi = _mm256_extracti128_si256(vi, 1);
+                            __m128i out;
+                            if constexpr (std::is_same_v<T, uint8_t>) {
+                                __m128i u16 = _mm_packus_epi32(lo, hi);
+                                out = _mm_packus_epi16(u16, u16);
+                            } else {
+                                __m128i s16 = _mm_packs_epi32(lo, hi);
+                                out = _mm_packs_epi16(s16, s16);
+                            }
+                            _mm_storel_epi64((__m128i*)(dst + c), out);
+                        }
                     }
 #endif
                     for (; c < C; c++) {
@@ -191,6 +263,47 @@ struct QLinearMul_operator : public operator_t {
                         v = _mm512_max_ps(_mm512_min_ps(v, vmax), vmin);
                         _mm_storeu_si128((__m128i*)(dst + i),
                             _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v)));
+                    }
+                    for (; i < HW; i++) {
+                        float val = bval * (float)((int32_t)src[i] - full_zp) + (float)y_zp;
+                        dst[i] = (T)std::clamp((int32_t)std::nearbyint(val), clamp_min, clamp_max);
+                    }
+                });
+                return true;
+            }
+            if (detect_isa() >= isa_t::avx2) {
+                nnr::for_dynamic(0, NC, par, [&](int, int nc) {
+                    int c = nc % C;
+                    float bval = cs * (float)((int32_t)p_ch[c] - ch_zp);
+                    __m256 vbval = _mm256_set1_ps(bval);
+                    __m256 vfzp = _mm256_set1_ps((float)full_zp);
+                    __m256 vyzp = _mm256_set1_ps((float)y_zp);
+                    __m256 vmin = _mm256_set1_ps((float)clamp_min);
+                    __m256 vmax = _mm256_set1_ps((float)clamp_max);
+                    const T* src = p_full + (size_t)nc * HW;
+                    T* dst = py + (size_t)nc * HW;
+                    int i = 0;
+                    for (; i + 8 <= HW; i += 8) {
+                        __m256 fa;
+                        if constexpr (std::is_same_v<T, uint8_t>)
+                            fa = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(src + i))));
+                        else
+                            fa = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(src + i))));
+                        __m256 v = _mm256_fmadd_ps(_mm256_sub_ps(fa, vfzp), vbval, vyzp);
+                        v = _mm256_round_ps(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                        v = _mm256_max_ps(_mm256_min_ps(v, vmax), vmin);
+                        __m256i vi = _mm256_cvtps_epi32(v);
+                        __m128i lo = _mm256_castsi256_si128(vi);
+                        __m128i hi = _mm256_extracti128_si256(vi, 1);
+                        __m128i out;
+                        if constexpr (std::is_same_v<T, uint8_t>) {
+                            __m128i u16 = _mm_packus_epi32(lo, hi);
+                            out = _mm_packus_epi16(u16, u16);
+                        } else {
+                            __m128i s16 = _mm_packs_epi32(lo, hi);
+                            out = _mm_packs_epi16(s16, s16);
+                        }
+                        _mm_storel_epi64((__m128i*)(dst + i), out);
                     }
                     for (; i < HW; i++) {
                         float val = bval * (float)((int32_t)src[i] - full_zp) + (float)y_zp;

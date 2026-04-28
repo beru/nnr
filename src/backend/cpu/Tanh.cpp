@@ -3,6 +3,7 @@
 #include "thread_pool.h"
 #ifdef NNR_ARCH_X64
 #include "backend/x64/simd_math_avx512.h"
+#include "backend/x64/simd_math_avx2.h"
 #elifdef NNR_ARCH_ARM64
 #include "backend/arm/simd_math_neon.h"
 #endif
@@ -19,7 +20,8 @@ struct Tanh_operator : public operator_t {
         if (!bias && stride == cols) {
             size_t n = (size_t)rows * cols;
 #ifdef NNR_ARCH_X64
-            tanh_avx512_kernel(data, data, n);
+            if (has_avx512()) tanh_avx512_kernel(data, data, n);
+            else              tanh_avx2_kernel  (data, data, n);
 #else
             tanh_neon_kernel(data, data, n);
 #endif
@@ -75,7 +77,8 @@ struct Tanh_operator : public operator_t {
                 const float* src = px + (size_t)nc * iH * W + (size_t)out_row_start * W;
                 float* dst = py + (size_t)nc * oH * W + (size_t)out_row_start * W;
 #ifdef NNR_ARCH_X64
-                tanh_avx512_kernel(src, dst, count);
+                if (has_avx512()) tanh_avx512_kernel(src, dst, count);
+                else              tanh_avx2_kernel  (src, dst, count);
 #else
                 tanh_neon_kernel(src, dst, count);
 #endif
@@ -103,7 +106,8 @@ struct Tanh_operator : public operator_t {
             nnr::for_static(0, nchunks, nchunks > 1, [&](int c) {
                 size_t start = (size_t)c * CHUNK;
                 size_t end = std::min(start + CHUNK, n);
-                tanh_avx512_kernel(px + start, py + start, end - start);
+                if (has_avx512()) tanh_avx512_kernel(px + start, py + start, end - start);
+                else              tanh_avx2_kernel  (px + start, py + start, end - start);
             });
             return true;
 #elifdef NNR_ARCH_ARM64

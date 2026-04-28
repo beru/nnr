@@ -368,7 +368,9 @@
             // Skips im2col entirely, saving 7+MB buffer for 7×7 stride-2 layers.
 #ifdef NNR_ARCH_X64
             // Format: [IC, KH, KW, OC/16, 16] — vectorize over 16 OC.
-            if (x->type == NNR_DATA_TYPE_FLOAT32 && !depthwise && group == 1
+            // First/last-layer direct kernels are AVX-512-only (16-wide ZMM tiles).
+            if (has_avx512()
+                && x->type == NNR_DATA_TYPE_FLOAT32 && !depthwise && group == 1
                 && iC <= 4 && kH >= 3 && MM >= 16) {
                 size_t psz = pack_weights_first_layer_size(MM, iC, kH, kW);
                 w_first_layer.resize(psz);
@@ -381,7 +383,8 @@
             // Last-layer direct conv: small-OC Conv (e.g., RGB output).
             // Vectorizes over output width (16 pixels per ZMM), skipping im2col.
             // Conditions: OC <= 16, stride == 1, group == 1, not first-layer.
-            if (x->type == NNR_DATA_TYPE_FLOAT32 && !depthwise && group == 1
+            if (has_avx512()
+                && x->type == NNR_DATA_TYPE_FLOAT32 && !depthwise && group == 1
                 && w_first_layer.empty()
                 && MM <= 16 && kH >= 3
                 && strides.size() >= 2 && strides[0] == 1 && strides[1] == 1

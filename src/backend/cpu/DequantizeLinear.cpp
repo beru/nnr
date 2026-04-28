@@ -109,24 +109,36 @@ struct DequantizeLinear_operator : public operator_t {
                 float* py = (float*)y->data;
                 size_t total = x->ndata;
 #ifdef NNR_ARCH_X64
-                if (has_avx512() && total >= 64) {
-                    // ORT-style cost-based threading: int8→float = 1B in, 4B out, 2 compute
+                if (total >= 64 && (has_avx512() || detect_isa() >= isa_t::avx2)) {
                     int nt = nnr::elementwise_threads(total, 1, 4, 2);
                     constexpr size_t BLOCK = 4096;
                     int nblocks = (int)((total + BLOCK - 1) / BLOCK);
                     nnr::for_dynamic(0, nblocks, nt, [&](int /*tid*/, int blk) {
                         size_t base = (size_t)blk * BLOCK;
                         size_t end = std::min(base + BLOCK, total);
-                        __m512 vs = _mm512_set1_ps(scale);
-                        __m512 vz = _mm512_set1_ps((float)zero);
-                        size_t i = base;
-                        for (; i + 16 <= end; i += 16) {
-                            __m512 v = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
-                                _mm_loadu_si128((const __m128i*)(px + i))));
-                            _mm512_storeu_ps(py + i, _mm512_mul_ps(_mm512_sub_ps(v, vz), vs));
+                        if (has_avx512()) {
+                            __m512 vs = _mm512_set1_ps(scale);
+                            __m512 vz = _mm512_set1_ps((float)zero);
+                            size_t i = base;
+                            for (; i + 16 <= end; i += 16) {
+                                __m512 v = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                                    _mm_loadu_si128((const __m128i*)(px + i))));
+                                _mm512_storeu_ps(py + i, _mm512_mul_ps(_mm512_sub_ps(v, vz), vs));
+                            }
+                            for (; i < end; i++)
+                                py[i] = ((float)px[i] - (float)zero) * scale;
+                        } else {
+                            __m256 vs = _mm256_set1_ps(scale);
+                            __m256 vz = _mm256_set1_ps((float)zero);
+                            size_t i = base;
+                            for (; i + 8 <= end; i += 8) {
+                                __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                                    _mm_loadl_epi64((const __m128i*)(px + i))));
+                                _mm256_storeu_ps(py + i, _mm256_mul_ps(_mm256_sub_ps(v, vz), vs));
+                            }
+                            for (; i < end; i++)
+                                py[i] = ((float)px[i] - (float)zero) * scale;
                         }
-                        for (; i < end; i++)
-                            py[i] = ((float)px[i] - (float)zero) * scale;
                     });
                 } else
 #endif
@@ -138,23 +150,36 @@ struct DequantizeLinear_operator : public operator_t {
                 float* py = (float*)y->data;
                 size_t total = x->ndata;
 #ifdef NNR_ARCH_X64
-                if (has_avx512() && total >= 64) {
+                if (total >= 64 && (has_avx512() || detect_isa() >= isa_t::avx2)) {
                     int nt = nnr::elementwise_threads(total, 1, 4, 2);
                     constexpr size_t BLOCK = 4096;
                     int nblocks = (int)((total + BLOCK - 1) / BLOCK);
                     nnr::for_dynamic(0, nblocks, nt, [&](int /*tid*/, int blk) {
                         size_t base = (size_t)blk * BLOCK;
                         size_t end = std::min(base + BLOCK, total);
-                        __m512 vs = _mm512_set1_ps(scale);
-                        __m512 vz = _mm512_set1_ps((float)zero);
-                        size_t i = base;
-                        for (; i + 16 <= end; i += 16) {
-                            __m512 v = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
-                                _mm_loadu_si128((const __m128i*)(px + i))));
-                            _mm512_storeu_ps(py + i, _mm512_mul_ps(_mm512_sub_ps(v, vz), vs));
+                        if (has_avx512()) {
+                            __m512 vs = _mm512_set1_ps(scale);
+                            __m512 vz = _mm512_set1_ps((float)zero);
+                            size_t i = base;
+                            for (; i + 16 <= end; i += 16) {
+                                __m512 v = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                                    _mm_loadu_si128((const __m128i*)(px + i))));
+                                _mm512_storeu_ps(py + i, _mm512_mul_ps(_mm512_sub_ps(v, vz), vs));
+                            }
+                            for (; i < end; i++)
+                                py[i] = ((float)px[i] - (float)zero) * scale;
+                        } else {
+                            __m256 vs = _mm256_set1_ps(scale);
+                            __m256 vz = _mm256_set1_ps((float)zero);
+                            size_t i = base;
+                            for (; i + 8 <= end; i += 8) {
+                                __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+                                    _mm_loadl_epi64((const __m128i*)(px + i))));
+                                _mm256_storeu_ps(py + i, _mm256_mul_ps(_mm256_sub_ps(v, vz), vs));
+                            }
+                            for (; i < end; i++)
+                                py[i] = ((float)px[i] - (float)zero) * scale;
                         }
-                        for (; i < end; i++)
-                            py[i] = ((float)px[i] - (float)zero) * scale;
                     });
                 } else
 #endif

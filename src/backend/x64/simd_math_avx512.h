@@ -134,6 +134,20 @@ void sub_avx512(const float* a, const float* b, float* dst, size_t n);
 // @nnr-meta isa=AVX512 dtype=fp32
 void div_avx512(const float* a, const float* b, float* dst, size_t n);
 
+// Broadcast binary op: y = a OP b with general ONNX numpy-style broadcast.
+// dims/a_bstr/b_bstr are output-shape-aligned; bstr[d]==0 means broadcast along
+// dim d, otherwise the per-element stride into the input. ndim is the output
+// rank. Threaded over the outer (non-collapsed) iteration; SIMD over the
+// largest contiguous trailing run. @nnr-meta isa=AVX512 dtype=fp32
+void mul_broadcast_avx512(const float* a, const float* b, float* y,
+    const int* dims, const int* a_bstr, const int* b_bstr, int ndim);
+void add_broadcast_avx512(const float* a, const float* b, float* y,
+    const int* dims, const int* a_bstr, const int* b_bstr, int ndim);
+void sub_broadcast_avx512(const float* a, const float* b, float* y,
+    const int* dims, const int* a_bstr, const int* b_bstr, int ndim);
+void div_broadcast_avx512(const float* a, const float* b, float* y,
+    const int* dims, const int* a_bstr, const int* b_bstr, int ndim);
+
 // Apply GELU (exact, erf-based): dst[i] = 0.5 * x * (1 + erf(x / sqrt(2))) (threaded, AVX-512).
 // @nnr-meta isa=AVX512 dtype=fp32
 void gelu_avx512(const float* src, float* dst, size_t n);

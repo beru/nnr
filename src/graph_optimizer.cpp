@@ -142,6 +142,14 @@ void graph_optimizer_t::reset_formats()
         t->format = NATIVE_BLOCKED_FMT;
 }
 
+void graph_optimizer_t::reset_formats_to_nchw()
+{
+    for (auto* t : nhwc_tensors)
+        t->format = memory_layout_t::NCHW;
+    for (auto* t : blocked_tensors)
+        t->format = memory_layout_t::NCHW;
+}
+
 void graph_optimizer_t::build_exec_steps(context_t* ctx)
 {
     if (!ctx || !ctx->graph || !plan_built) return;

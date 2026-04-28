@@ -12,8 +12,17 @@ struct Identity_operator : public operator_t {
     }
 
     bool exec_impl() {
-        if (outputs[0]->data != inputs[0]->data)
-            copy_data(outputs[0], inputs[0]);
+        tensor_t* y = outputs[0];
+        const tensor_t* x = inputs[0];
+        // Self-reshape if upstream dynamic-shape producer (NMS/TopK/...)
+        // shrunk x at exec time. copy_data uses y->ndata, so a stale
+        // upper-bound size would read past the live x region.
+        // See kb/dynamic_shape_pool_view.md.
+        if (x->ndata != y->ndata) {
+            if (!reshape()) return false;
+        }
+        if (y->data != x->data)
+            copy_data(y, x);
         return true;
     }
 

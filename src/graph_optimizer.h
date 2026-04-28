@@ -69,6 +69,17 @@ struct graph_optimizer_t {
     // Virtual: same rationale as preprocess().
     virtual void optimize(context_t* ctx) = 0;
 
+    // --- Re-derive SCHEDULING-level state after input shapes changed ---
+    // Clears scroll_segments / scroll_detection_done / plan / exec_steps,
+    // re-runs detect_scroll_chains + prune_segments against the new shapes,
+    // resolves the AUTO scroll state, and rebuilds plan + exec_steps.
+    //
+    // Constraint: assumes channel counts and op structure are stable across
+    // reinit() (the LAYOUT-level passes are NOT re-run — they mutate the
+    // graph and depend on channel counts). Suitable for batch/spatial-dim
+    // changes; full reload required for channel-count changes.
+    virtual void rerun_after_shape_change(context_t* ctx) = 0;
+
     // --- Build execution plan from current graph state ---
     // Must be called after optimize() and whenever skip/folded flags change.
     void build_plan(context_t* ctx);
@@ -98,6 +109,9 @@ struct graph_optimizer_t {
     bool scroll_detection_done = false;
     bool plan_built = false;
     bool scrolling_resolved = false;  // final decision after AUTO resolution
+    // Set during rerun_after_shape_change so SCHEDULING-level passes that
+    // execute ops (prune_segments) can skip — buffers are mid-rebuild.
+    bool scheduling_in_rerun = false;
 
     // Layout optimization: workspace needed for NHWC↔NCHW reorder at boundaries
     size_t layout_reorder_ws = 0;
@@ -110,6 +124,12 @@ struct graph_optimizer_t {
     std::vector<tensor_t*> blocked_tensors;
 
     void reset_formats();
+
+    // Force NHWC/blocked tensors back to NCHW. Used during shape-change
+    // rerun: fold_run re-allocates these tensors as plain NCHW heap, but
+    // the format flag survives from the first run; ops that dispatch on
+    // format would interpret the fresh allocation as BLOCKED_16 and crash.
+    void reset_formats_to_nchw();
 
     // --- Pre-compiled execution steps (flat, no SKIP/FOLDED/SCROLL_INSIDE) ---
     // Built by build_exec_steps() after build_plan(). Replaces per-node

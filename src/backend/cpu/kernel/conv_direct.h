@@ -59,6 +59,12 @@ inline bool conv_direct(
     const PostFn& post_fn)
 {
 #ifdef NNR_ARCH_X64
+    if (!has_avx512()) {
+        // AVX-512-only kernel; fall back to im2col path on AVX-2-only hosts.
+        (void)M;(void)oH;(void)oW;(void)K;(void)packed_A;(void)padded;
+        (void)offsets;(void)padW;(void)sH;(void)Y;(void)post_fn;
+        return false;
+    }
     return avx512::conv_direct_nchw(M, oH, oW, K, packed_A, padded, offsets,
         padW, sH, Y, post_fn);
 #else
