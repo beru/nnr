@@ -347,42 +347,92 @@
                     continue;
                 }
 
-                // im2col for the strip + GEMM
+                // Tiled im2col + GEMM within the strip. Workspace is sized
+                // for one tile_h-row chunk plus an MM×tile_sp scatter buffer
+                // (see workspace_size() / im2col_tile_h()); iterate the strip
+                // in tile_h chunks and apply bias / fused post-op once at the
+                // end, mirroring exec_conv_im2col_tiled (Conv_exec_nchw.h).
+                const int tile_h = im2col_tile_h();
+                if (tile_h <= 0) return false;
                 float* col = (float*)ctx->workspace;
-                for (int c = 0; c < kC; ++c) {
-                    const float* xc = xn + (size_t)c * iH * iW;
-                    for (int kh = 0; kh < kH; ++kh) {
-                        for (int kw = 0; kw < kW; ++kw) {
-                            int k = (c * kH + kh) * kW + kw;
-                            float* dst = col + (size_t)k * spatial_strip;
-                            for (int oh = out_row_start; oh < out_end; ++oh) {
-                                int ih = oh * sH - pH + kh * dH;
-                                float* drow = dst + (oh - out_row_start) * oW;
-                                if (ih < 0 || ih >= iH_pad) {
-                                    memset(drow, 0, oW * sizeof(float));
-                                    continue;
-                                }
-                                const float* srow = xc + ih * iW;
-                                int iw_base = kw * dW - pW;
-                                if (sW == 1) {
-                                    int w0 = std::max(0, -iw_base);
-                                    int w1 = std::min(oW, iW - iw_base);
-                                    if (w0 > 0) memset(drow, 0, w0 * sizeof(float));
-                                    if (w1 > w0) memcpy(drow + w0, srow + iw_base + w0, (w1 - w0) * sizeof(float));
-                                    if (w1 < oW) memset(drow + w1, 0, (oW - w1) * sizeof(float));
-                                } else {
-                                    for (int ow = 0; ow < oW; ++ow) {
-                                        int iw = ow * sW + iw_base;
-                                        drow[ow] = (iw >= 0 && iw < iW) ? srow[iw] : 0.0f;
+                // Fast path: single tile covers a full per-channel slot
+                // (out_row_start=0, actual_out_rows=oH, tile_h>=oH). dgemm
+                // output stride matches yn's per-channel pitch (oH*oW), so
+                // dgemm can write directly into yn — saves the MM × oH × oW
+                // memcpy. Multi-tile or partial-strip cases need the scatter
+                // buffer because per-tile dgemm rows are tile_sp-strided.
+                const bool single_full_tile = (out_row_start == 0
+                                              && actual_out_rows == oH
+                                              && tile_h >= actual_out_rows);
+                float* tmp = single_full_tile ? nullptr
+                    : col + (size_t)CHW * (size_t)tile_h * oW;
+                for (int oh0 = out_row_start; oh0 < out_end; oh0 += tile_h) {
+                    int th = std::min(tile_h, out_end - oh0);
+                    int tile_sp = th * oW;
+                    for (int c = 0; c < kC; ++c) {
+                        const float* xc = xn + (size_t)c * iH * iW;
+                        for (int kh = 0; kh < kH; ++kh) {
+                            for (int kw = 0; kw < kW; ++kw) {
+                                int k = (c * kH + kh) * kW + kw;
+                                float* dst = col + (size_t)k * tile_sp;
+                                for (int oh = oh0; oh < oh0 + th; ++oh) {
+                                    int ih = oh * sH - pH + kh * dH;
+                                    float* drow = dst + (oh - oh0) * oW;
+                                    if (ih < 0 || ih >= iH_pad) {
+                                        memset(drow, 0, oW * sizeof(float));
+                                        continue;
+                                    }
+                                    const float* srow = xc + ih * iW;
+                                    int iw_base = kw * dW - pW;
+                                    if (sW == 1) {
+                                        int w0 = std::max(0, -iw_base);
+                                        int w1 = std::min(oW, iW - iw_base);
+                                        if (w0 > 0) memset(drow, 0, w0 * sizeof(float));
+                                        if (w1 > w0) memcpy(drow + w0, srow + iw_base + w0, (w1 - w0) * sizeof(float));
+                                        if (w1 < oW) memset(drow + w1, 0, (oW - w1) * sizeof(float));
+                                    } else {
+                                        for (int ow = 0; ow < oW; ++ow) {
+                                            int iw = ow * sW + iw_base;
+                                            drow[ow] = (iw >= 0 && iw < iW) ? srow[iw] : 0.0f;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    if (single_full_tile) {
+                        // tile_sp == oH*oW so dgemm row stride matches yn's
+                        // per-channel pitch — write directly, no scatter.
+                        dgemm_generic(MM, tile_sp, CHW,
+                            wd + (size_t)g * MM * CHW, col, yn);
+                    } else {
+                        dgemm_generic(MM, tile_sp, CHW,
+                            wd + (size_t)g * MM * CHW, col, tmp);
+                        // Scatter tmp[m * tile_sp] → yn[m*oH*oW + (oh0 - out_row_start)*oW]
+                        for (int m = 0; m < MM; ++m)
+                            memcpy(yn + (size_t)m * oH * oW + (size_t)(oh0 - out_row_start) * oW,
+                                tmp + (size_t)m * tile_sp,
+                                (size_t)tile_sp * sizeof(float));
+                    }
                 }
-                dgemm_generic(MM, spatial_strip, CHW,
-                    wd + (size_t)g * MM * CHW, col, yn,
-                    gemm_post_t((const float*)bias, g * MM, yn, yn_off, this));
+                // Apply bias / fused post-op once over the strip rows.
+                // post_fn signature: (data, rows, cols, stride, fused_op, bias, offset)
+                // — stride is per-channel pitch in the full output (oH*oW),
+                // cols is the strip's flat element count, offset is where the
+                // strip starts in the global output (binary Add post-op uses it
+                // to index its second operand).
+                if (post_fn) {
+                    post_fn(yn, MM, spatial_strip, oH * oW, fused_op,
+                            bias ? (const float*)bias + g * MM : nullptr, yn_off);
+                } else if (bias) {
+                    for (int m = 0; m < MM; ++m) {
+                        float bv = bias[g * MM + m];
+                        if (bv == 0.0f) continue;
+                        float* row = yn + (size_t)m * oH * oW;
+                        for (int j = 0; j < spatial_strip; ++j)
+                            row[j] += bv;
+                    }
+                }
             }
         }
         return true;

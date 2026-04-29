@@ -59,7 +59,12 @@ inline void maxpool_2d_neon(const float* input, float* output,
                 // Stride-2: process 4 output pixels at a time
                 // Each output pixel reads from input at iw = ow*2 - pW
                 // So 4 output pixels need 8 consecutive input positions + (kW-1) extra
-                for (; ow + 4 <= ow_safe_hi; ow += 4) {
+                // vld2q_f32 reads 8 contiguous floats at row+kw, so the last block's
+                // top access is row[iw0 + (kW-1) + 7]. ow_safe_hi alone permits
+                // reaching iW exactly (1 element past end); cap the SIMD loop
+                // tighter and let the scalar tail handle the last block.
+                int simd_hi = std::min(ow_safe_hi, (iW - kW + pW + 1) / 2);
+                for (; ow + 4 <= simd_hi; ow += 4) {
                     int iw0 = ow * 2 - pW;
                     float32x4_t vmax = vdupq_n_f32(-FLT_MAX);
                     for (int kh = kh0; kh < kh1; ++kh) {
@@ -136,7 +141,9 @@ inline void maxpool_2d_strip_neon(const float* input, float* output,
                     vst1q_f32(dst + ow, vmax);
                 }
             } else if (sW == 2) {
-                for (; ow + 4 <= ow_safe_hi; ow += 4) {
+                // See maxpool_2d_neon: vld2q reads 8 floats; tighten bound.
+                int simd_hi = std::min(ow_safe_hi, (iW - kW + pW + 1) / 2);
+                for (; ow + 4 <= simd_hi; ow += 4) {
                     int iw0 = ow * 2 - pW;
                     float32x4_t vmax = vdupq_n_f32(-FLT_MAX);
                     for (int kh = kh0; kh < kh1; ++kh) {

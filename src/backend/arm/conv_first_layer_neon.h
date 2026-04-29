@@ -39,12 +39,17 @@ inline bool conv_first_layer_neon(
     // Work buffer: one row in interleaved layout [oW][OC_blocks*4]
     const size_t row_elems = (size_t)oW * OC_blocks * 4;
 
-    nnr::for_static(0, oH, oH >= 4, [&](int oh) {
-        std::vector<float> buf(row_elems);
+    // Per-thread scratch for the interleaved row buffer. Hoisted out of
+    // the row loop so we don't malloc 150 KB × oH per inference (Conv_219
+    // on ssd-12: 600 rows × 3 reps = 1800 alloc/free pairs).
+    NNR_POOL_ENSURE_SCRATCH(row_elems * sizeof(float));
+
+    nnr::for_dynamic(0, oH, oH >= 4, [&](int tid, int oh) {
+        float* buf_ptr = (float*)NNR_POOL_SCRATCH(tid);
         const int out_stride = OC_blocks * 4;
 
         for (int ob = 0; ob < OC_blocks; ob++) {
-            float* out_ob = buf.data() + ob * 4;
+            float* out_ob = buf_ptr + ob * 4;
 
             // Initialize with bias
             float32x4_t vbias;
@@ -135,7 +140,7 @@ inline bool conv_first_layer_neon(
             float* y_row = y + (size_t)oc * spatial + oh * oW;
             int ob = oc / 4, lane = oc % 4;
             for (int ow2 = 0; ow2 < oW; ow2++)
-                y_row[ow2] = buf[(size_t)ow2 * OC_blocks * 4 + ob * 4 + lane];
+                y_row[ow2] = buf_ptr[(size_t)ow2 * OC_blocks * 4 + ob * 4 + lane];
         }
 
         if (post_fn) {

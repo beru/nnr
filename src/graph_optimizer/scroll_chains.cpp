@@ -388,6 +388,7 @@ bool graph_optimizer_t::exec_scroll_segment(context_t* ctx, int seg_start, int s
     }
     if (ops.size() < 2) return false;  // not worth scrolling
 
+
     // Mixed-format segments are now handled cleanly:
     // (a) Conv kernels write y->format = y->declared_layout (no silent
     //     overrides), and (b) Conv::exec_strip returns false for BLOCKED
@@ -669,6 +670,30 @@ bool graph_optimizer_t::exec_scroll_segment(context_t* ctx, int seg_start, int s
             t->format = rings[k].saved_fmt;
         }
 
+        // Forward-alias skip nodes' outputs to their inputs[0]. The fast-path
+        // run loop defers SKIP-action aliasing until *after* SCROLL_START
+        // returns (see exec_steps in nnr.cpp), so without this, the next
+        // active op reads a stale, never-written buffer for any input whose
+        // producer is upstream of a skip node — e.g. fused-into-Conv Relu
+        // between two chain Convs. Must run AFTER the ring-pointer setup
+        // above so skip outputs pick up the virtual ring pointers, and AFTER
+        // halo reuse below... actually this position is fine: halo memmove
+        // operates on rings[k].buf directly, not on t->data. Aliasing here
+        // also handles non-ring (single-strip, full-output) chains where the
+        // active op's output tensor was unchanged but the skip output still
+        // points at its own un-written buffer.
+        for (int i = seg_start; i < seg_end; ++i) {
+            auto* nd = nodes[i];
+            if (!nd->skip || nd->folded) continue;
+            if (nd->inputs.empty() || nd->outputs.empty()) continue;
+            if (!nd->inputs[0] || !nd->outputs[0]) continue;
+            nd->outputs[0]->data = nd->inputs[0]->data;
+            nd->outputs[0]->owns_data = false;
+            nd->outputs[0]->dims[2] = nd->inputs[0]->dims[2];
+            nd->outputs[0]->ndata = nd->inputs[0]->ndata;
+            nd->outputs[0]->format = nd->inputs[0]->format;
+        }
+
         // Set ring_in/ring_out on operators for boundary/padding checks.
         // ring_in tracks the PRIMARY input's producer ring (producer_of[k][0])
         // — strip kernels read that one for halo/clamp metadata. Secondary
@@ -727,6 +752,25 @@ bool graph_optimizer_t::exec_scroll_segment(context_t* ctx, int seg_start, int s
         t->data = rings[k].saved_data;
         t->dims[2] = rings[k].saved_dims2;
         t->ndata = rings[k].saved_ndata;
+    }
+
+    // Re-establish skip-node aliases against the *restored* data pointers.
+    // During the strip loop above, skip outputs were aliased to ring buffers
+    // (so chain Convs whose input was upstream of a skip read the right data);
+    // those rings will be freed when the caller's arena_scope_t pops. Without
+    // re-aliasing here, skip outputs would dangle into freed memory and the
+    // next prune_segments trial's run_layer (which doesn't re-alias) would
+    // read garbage — observed as deterministic failure on AUTO-mode 5conv.
+    for (int i = seg_start; i < seg_end; ++i) {
+        auto* nd = nodes[i];
+        if (!nd->skip || nd->folded) continue;
+        if (nd->inputs.empty() || nd->outputs.empty()) continue;
+        if (!nd->inputs[0] || !nd->outputs[0]) continue;
+        nd->outputs[0]->data = nd->inputs[0]->data;
+        nd->outputs[0]->owns_data = false;
+        nd->outputs[0]->dims[2] = nd->inputs[0]->dims[2];
+        nd->outputs[0]->ndata = nd->inputs[0]->ndata;
+        nd->outputs[0]->format = nd->inputs[0]->format;
     }
 
     // Clear ring state on operators

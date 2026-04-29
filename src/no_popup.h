@@ -111,10 +111,12 @@ inline int seh_filter(EXCEPTION_POINTERS* ep)
         mei.ThreadId = GetCurrentThreadId();
         mei.ExceptionPointers = ep;
         mei.ClientPointers = FALSE;
+        // MiniDumpNormal: stack + registers + module list only. Sufficient
+        // to resolve a backtrace under cdb/windbg, and ~100× smaller than
+        // MiniDumpWithFullMemory which dumps the entire process address
+        // space (hundreds of MB on a model with weights loaded).
         MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hf,
-                          (MINIDUMP_TYPE)(MiniDumpWithFullMemory |
-                                          MiniDumpWithThreadInfo |
-                                          MiniDumpWithHandleData),
+                          MiniDumpNormal,
                           &mei, NULL, NULL);
         CloseHandle(hf);
         fprintf(stderr, "minidump: %s\n", dump_name);

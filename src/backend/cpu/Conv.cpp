@@ -199,14 +199,17 @@ struct Conv_operator : public operator_t {
             size_t elem = data_type_sizeof(inputs[0]->type);
             int tile_h = im2col_tile_h();
             int tile_spatial = tile_h * ws_oW;
-            int oH = ws_oW > 0 ? ws_spatial / ws_oW : 0;
-            bool tiling = (tile_h < oH);
             ws = (size_t)ws_CHW * tile_spatial * elem;
-            // NCHW tiled path needs a scatter buffer: MM × tile_spatial
-            if (tiling) {
-                int MM = inputs[1]->dims[0] / group;
-                ws += (size_t)MM * tile_spatial * elem;
-            }
+            // NCHW tiled path uses an MM × tile_spatial scatter buffer.
+            // The non-strip exec only needs it when tile_h < oH (multiple
+            // tiles), but the strip exec (Conv_exec_entry.h) always uses
+            // it because per-channel strip pitch differs from tile_spatial.
+            // Reserve unconditionally so a scrolling conv never overruns
+            // workspace into adjacent allocations during prune_segments'
+            // trial run (which corrupted adjacent weights and gave flaky
+            // path_tests/scroll_chain_*conv outputs).
+            int MM = inputs[1]->dims[0] / group;
+            ws += (size_t)MM * tile_spatial * elem;
             // NHWC general conv with groups > 1 needs extra scatter buffer
             if (!w_gemm_nhwc.empty() && group > 1) {
                 int MM = inputs[1]->dims[0] / group;

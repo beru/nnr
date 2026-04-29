@@ -1860,9 +1860,24 @@ bool context_t::run_for_warmup()
     // Execute graph for warmup (fills tensor data for scroll timing).
     // Skip nodes whose inputs have null data or undefined type — these
     // depend on un-executed expensive/control-flow ops and would crash.
+    // Also forward-alias skip-node outputs to their inputs in pass order:
+    // run_graph's fast path does this via the SKIP exec_step, but that
+    // path isn't active during prune_segments warmup. Without aliasing,
+    // a Conv whose input is the output of a fused-Relu skip node reads
+    // an uninitialized buffer in trial timings, biasing the scroll-vs-
+    // layer comparison and corrupting prune_segments' decision.
     auto& nodes = graph->nodes;
     for (auto* n : nodes) {
-        if (n->skip || n->folded) continue;
+        if (n->folded) continue;
+        if (n->skip) {
+            if (!n->inputs.empty() && !n->outputs.empty()
+                && n->inputs[0] && n->outputs[0]) {
+                n->outputs[0]->data = n->inputs[0]->data;
+                n->outputs[0]->owns_data = false;
+                n->outputs[0]->format = n->inputs[0]->format;
+            }
+            continue;
+        }
         bool safe = true;
         for (auto* t : n->inputs)
             if (t && (!t->data || t->type == NNR_DATA_TYPE_UNDEFINED)) { safe = false; break; }
