@@ -1,4 +1,5 @@
 #include "graph_optimizer/graph_optimizer_internal.h"
+#include "graph_optimizer/qdq_helpers.h"
 #include "aligned_alloc.h"
 
 namespace nnr {
@@ -15,24 +16,7 @@ void fuse_qdq(context_t* ctx)
     const int n = static_cast<int>(nodes.size());
     int fused_count = 0;
 
-    // Build producer map: tensor_t* → node index
-    std::unordered_map<tensor_t*, int> producer;
-    for (int i = 0; i < n; i++) {
-        if (nodes[i]->skip || nodes[i]->folded) continue;
-        for (auto* t : nodes[i]->outputs)
-            producer[t] = i;
-    }
-
-    // Count consumers for each tensor
-    auto count_consumers = [&](tensor_t* tensor, int skip_idx) -> int {
-        int count = 0;
-        for (int j = 0; j < n; j++) {
-            if (j == skip_idx || nodes[j]->skip || nodes[j]->folded) continue;
-            for (auto* t : nodes[j]->inputs)
-                if (t == tensor) count++;
-        }
-        return count;
-    };
+    auto producer = qdq_helpers::build_producer_map(nodes);
 
     // Helper: extract scalar scale and zero-point from DequantizeLinear/QuantizeLinear inputs
     auto get_scale_zp = [](operator_t* dq_or_q, float& scale, int32_t& zp) -> bool {
@@ -74,7 +58,7 @@ void fuse_qdq(context_t* ctx)
         tensor_t* dq_input = nd->inputs[0];     // quantized input tensor
 
         // DQ output must have exactly 1 consumer
-        if (count_consumers(dq_output, i) != 1) continue;
+        if (qdq_helpers::count_consumers(nodes,dq_output, i) != 1) continue;
 
         // Find the consumer op
         int consumer_idx = -1;
@@ -120,7 +104,7 @@ void fuse_qdq(context_t* ctx)
         operator_t* q_node = nodes[q_idx];
 
         // Consumer output must have exactly 1 consumer (the Q node)
-        if (count_consumers(consumer_output, consumer_idx) != 1) continue;
+        if (qdq_helpers::count_consumers(nodes,consumer_output, consumer_idx) != 1) continue;
 
         // Extract scale/zp from both DQ and Q
         float dq_scale, q_scale;

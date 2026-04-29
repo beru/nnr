@@ -99,99 +99,90 @@ int pass_manager_t::run_level(pass_level_t lvl, graph_optimizer_t& opt,
 }
 
 // ---------------------------------------------------------------------------
-// Registered passes (M1: just decompose_ops)
+// Registered passes
 // ---------------------------------------------------------------------------
+//
+// The vast majority of passes follow one of three apply() shapes:
+//
+//   SIMPLE        — no gate; just call the free function. (decompose_ops,
+//                   the WebGPU passes — those gate themselves internally on
+//                   preferred_backend.)
+//   GATED         — return false unless opt.fusion_enabled. (Most fusion /
+//                   layout helpers.)
+//   FUSION_FP     — gated, FUSION level, fingerprint-cascade for fixed-point
+//                   iteration.
+//
+// The handful of passes with compound gates (assign_*_layouts,
+// optimize_transposes, detect_scroll_chains, prune_segments) stay
+// hand-written below.
 
 namespace {
 
-struct decompose_ops_pass_t : pass_t {
-    bool apply(graph_optimizer_t& /*opt*/, context_t* ctx) override
-    {
-        decompose_ops(ctx);
-        return false;  // idempotent; no cascade
+#define DEFINE_SIMPLE_PASS(CLASS_NAME, FUNC, NAME_STR, LVL, ONCE)              \
+    struct CLASS_NAME : pass_t {                                               \
+        bool apply(graph_optimizer_t&, context_t* ctx) override                \
+        {                                                                      \
+            FUNC(ctx);                                                         \
+            return false;                                                      \
+        }                                                                      \
+        const char*  name()  const override { return NAME_STR; }               \
+        pass_level_t level() const override { return pass_level_t::LVL; }      \
+        bool         once()  const override { return ONCE; }                   \
     }
-    const char*  name()  const override { return "decompose_ops"; }
-    pass_level_t level() const override { return pass_level_t::PREPROCESS; }
-    bool         once()  const override { return true; }
-};
+
+#define DEFINE_GATED_PASS(CLASS_NAME, FUNC, NAME_STR, LVL, ONCE)               \
+    struct CLASS_NAME : pass_t {                                               \
+        bool apply(graph_optimizer_t& opt, context_t* ctx) override            \
+        {                                                                      \
+            if (!opt.fusion_enabled) return false;                             \
+            FUNC(ctx);                                                         \
+            return false;                                                      \
+        }                                                                      \
+        const char*  name()  const override { return NAME_STR; }               \
+        pass_level_t level() const override { return pass_level_t::LVL; }      \
+        bool         once()  const override { return ONCE; }                   \
+    }
+
+// FUSION-level passes use fingerprint-based change detection so run_level()
+// can iterate to a fixed point. The free functions are idempotent on a
+// stable graph, so calling them in a second round when nothing changed is a
+// cheap no-op — they scan and return without touching anything.
+#define DEFINE_FUSION_FP_PASS(CLASS_NAME, FUNC, NAME_STR)                      \
+    struct CLASS_NAME : pass_t {                                               \
+        bool apply(graph_optimizer_t& opt, context_t* ctx) override            \
+        {                                                                      \
+            if (!opt.fusion_enabled) return false;                             \
+            auto before = fingerprint(ctx);                                    \
+            FUNC(ctx);                                                         \
+            return fingerprint(ctx) != before;                                 \
+        }                                                                      \
+        const char*  name()  const override { return NAME_STR; }               \
+        pass_level_t level() const override                                    \
+        {                                                                      \
+            return pass_level_t::FUSION;                                       \
+        }                                                                      \
+        bool once() const override { return false; }                           \
+    }
+
+DEFINE_SIMPLE_PASS(decompose_ops_pass_t, decompose_ops, "decompose_ops",
+                   PREPROCESS, true);
 
 // fuse_conv_bn leaves BN as a SKIP-handled alias to its inputs, and the alias
 // copy needs the input tensor to be backed by a real allocation — so it must
 // run at FUSION level (post fold_run), not PREPROCESS. Otherwise the SKIP
 // aliasing reads null data.
-struct fuse_conv_bn_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        fuse_conv_bn(ctx);
-        return false;  // idempotent; no cascade
-    }
-    const char*  name()  const override { return "fuse_conv_bn"; }
-    pass_level_t level() const override { return pass_level_t::FUSION; }
-    bool         once()  const override { return true; }
-};
+DEFINE_GATED_PASS(fuse_conv_bn_pass_t, fuse_conv_bn, "fuse_conv_bn",
+                  FUSION, true);
 
-struct fuse_pad_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        fuse_pad(ctx);
-        return false;  // idempotent; no cascade
-    }
-    const char*  name()  const override { return "fuse_pad"; }
-    pass_level_t level() const override { return pass_level_t::PREPROCESS; }
-    bool         once()  const override { return true; }
-};
+DEFINE_GATED_PASS(fuse_pad_pass_t, fuse_pad, "fuse_pad", PREPROCESS, true);
+DEFINE_GATED_PASS(fuse_layer_norm_pass_t, fuse_layer_norm, "fuse_layer_norm",
+                  PREPROCESS, true);
+DEFINE_GATED_PASS(fuse_gelu_pass_t, fuse_gelu, "fuse_gelu", PREPROCESS, true);
+DEFINE_GATED_PASS(fuse_silu_pass_t, fuse_silu, "fuse_silu", PREPROCESS, true);
 
-struct fuse_layer_norm_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        fuse_layer_norm(ctx);
-        return false;  // idempotent; no cascade
-    }
-    const char*  name()  const override { return "fuse_layer_norm"; }
-    pass_level_t level() const override { return pass_level_t::PREPROCESS; }
-    bool         once()  const override { return true; }
-};
-
-struct fuse_gelu_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        fuse_gelu(ctx);
-        return false;  // idempotent; no cascade
-    }
-    const char*  name()  const override { return "fuse_gelu"; }
-    pass_level_t level() const override { return pass_level_t::PREPROCESS; }
-    bool         once()  const override { return true; }
-};
-
-struct fuse_silu_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        fuse_silu(ctx);
-        return false;  // idempotent; no cascade
-    }
-    const char*  name()  const override { return "fuse_silu"; }
-    pass_level_t level() const override { return pass_level_t::PREPROCESS; }
-    bool         once()  const override { return true; }
-};
-
-struct fuse_sdpa_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        fuse_sdpa(ctx);
-        return false;
-    }
-    const char*  name()  const override { return "fuse_sdpa"; }
-    // FUSION (not PREPROCESS): needs shape inference to have run so
-    // q_tensor->dims[...] is populated for the shape-compatibility checks.
-    pass_level_t level() const override { return pass_level_t::FUSION; }
-    bool         once()  const override { return true; }
-};
+// FUSION (not PREPROCESS): needs shape inference to have run so
+// q_tensor->dims[...] is populated for the shape-compatibility checks.
+DEFINE_GATED_PASS(fuse_sdpa_pass_t, fuse_sdpa, "fuse_sdpa", FUSION, true);
 
 // WebGPU-only: fold consecutive same-shape f32 unary elementwise ops into one
 // dispatch. Gated internally on ctx->preferred_backend == WEBGPU, so it's a
@@ -206,103 +197,31 @@ struct fuse_sdpa_pass_t : pass_t {
 // fusion. FUSION runs via both optimize() paths and post fold_run, which
 // has the added benefit of guaranteeing all input tensor shapes are
 // propagated by the time we build the fused op.
-struct fuse_webgpu_elementwise_pass_t : pass_t {
-    bool apply(graph_optimizer_t& /*opt*/, context_t* ctx) override
-    {
-        fuse_webgpu_elementwise(ctx);
-        return false;  // chain-building is single-pass; no cascade
-    }
-    const char*  name()  const override { return "fuse_webgpu_elementwise"; }
-    pass_level_t level() const override { return pass_level_t::FUSION; }
-    bool         once()  const override { return true; }
-};
+DEFINE_SIMPLE_PASS(fuse_webgpu_elementwise_pass_t, fuse_webgpu_elementwise,
+                   "fuse_webgpu_elementwise", FUSION, true);
 
 // WebGPU-only: absorb a FusedElementwiseChain that directly follows a
 // MatMul into the MatMul's output epilogue. Must run AFTER
 // fuse_webgpu_elementwise has built the chain nodes (registration order
 // controls FUSION-level ordering within a round). Gated internally on
 // preferred_backend == WEBGPU.
-struct fuse_webgpu_matmul_chain_pass_t : pass_t {
-    bool apply(graph_optimizer_t& /*opt*/, context_t* ctx) override
-    {
-        fuse_webgpu_matmul_chain(ctx);
-        return false;  // single-pass; no cascade
-    }
-    const char*  name()  const override { return "fuse_webgpu_matmul_chain"; }
-    pass_level_t level() const override { return pass_level_t::FUSION; }
-    bool         once()  const override { return true; }
-};
+DEFINE_SIMPLE_PASS(fuse_webgpu_matmul_chain_pass_t, fuse_webgpu_matmul_chain,
+                   "fuse_webgpu_matmul_chain", FUSION, true);
 
-struct fold_bn_qdq_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        fold_bn_qdq(ctx);
-        return false;  // idempotent; no cascade
-    }
-    const char*  name()  const override { return "fold_bn_qdq"; }
-    pass_level_t level() const override { return pass_level_t::PREPROCESS; }
-    bool         once()  const override { return true; }
-};
+DEFINE_GATED_PASS(fold_bn_qdq_pass_t, fold_bn_qdq, "fold_bn_qdq",
+                  PREPROCESS, true);
 
-// FUSION-level passes use fingerprint-based change detection so run_level()
-// can iterate to a fixed point. The free functions are idempotent on a
-// stable graph, so calling them in a second round when nothing changed is a
-// cheap no-op — they scan and return without touching anything.
-struct fold_constants_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        auto before = fingerprint(ctx);
-        fold_constants(ctx);
-        return fingerprint(ctx) != before;
-    }
-    const char*  name()  const override { return "fold_constants"; }
-    pass_level_t level() const override { return pass_level_t::FUSION; }
-    bool         once()  const override { return false; }
-};
+DEFINE_FUSION_FP_PASS(fold_constants_pass_t, fold_constants, "fold_constants");
 
 // Depends on fold_constants having folded weight-side DQ nodes. Registered
 // after fold_constants_pass_t and runs in the same FUSION-level sweep.
-struct fuse_qdq_compute_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        auto before = fingerprint(ctx);
-        fuse_qdq_compute(ctx);
-        return fingerprint(ctx) != before;
-    }
-    const char*  name()  const override { return "fuse_qdq_compute"; }
-    pass_level_t level() const override { return pass_level_t::FUSION; }
-    bool         once()  const override { return false; }
-};
+DEFINE_FUSION_FP_PASS(fuse_qdq_compute_pass_t, fuse_qdq_compute,
+                      "fuse_qdq_compute");
 
-struct fuse_qdq_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        auto before = fingerprint(ctx);
-        fuse_qdq(ctx);
-        return fingerprint(ctx) != before;
-    }
-    const char*  name()  const override { return "fuse_qdq"; }
-    pass_level_t level() const override { return pass_level_t::FUSION; }
-    bool         once()  const override { return false; }
-};
+DEFINE_FUSION_FP_PASS(fuse_qdq_pass_t, fuse_qdq, "fuse_qdq");
 
 // Must run after fold_constants (Clip min/max constants need folding first).
-struct fuse_post_ops_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        auto before = fingerprint(ctx);
-        fuse_post_ops(ctx);
-        return fingerprint(ctx) != before;
-    }
-    const char*  name()  const override { return "fuse_post_ops"; }
-    pass_level_t level() const override { return pass_level_t::FUSION; }
-    bool         once()  const override { return false; }
-};
+DEFINE_FUSION_FP_PASS(fuse_post_ops_pass_t, fuse_post_ops, "fuse_post_ops");
 
 // Layout rewrites (NCHWc blocked, NHWC) are CPU-specific: the AVX/NEON
 // kernels are packed-aware, but the WebGPU Conv/BN/Pool kernels assume
@@ -342,44 +261,16 @@ struct assign_layouts_pass_t : pass_t {
 // when NNR_EXPLICIT_REORDERS is OFF (the M1 default). Wired into LAYOUT
 // level after assign_*_layouts and before optimize_transposes so the
 // transpose-elimination cleanup still runs on the post-reorder graph.
-struct insert_reorders_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        insert_reorders(ctx);
-        return false;
-    }
-    const char*  name()  const override { return "insert_reorders"; }
-    pass_level_t level() const override { return pass_level_t::LAYOUT; }
-    bool         once()  const override { return true; }
-};
-
-struct cancel_reorders_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        cancel_reorders(ctx);
-        return false;
-    }
-    const char*  name()  const override { return "cancel_reorders"; }
-    pass_level_t level() const override { return pass_level_t::LAYOUT; }
-    bool         once()  const override { return true; }
-};
+DEFINE_GATED_PASS(insert_reorders_pass_t, insert_reorders, "insert_reorders",
+                  LAYOUT, true);
+DEFINE_GATED_PASS(cancel_reorders_pass_t, cancel_reorders, "cancel_reorders",
+                  LAYOUT, true);
 
 // SiLU post-op fusion. Runs at LAYOUT (not FUSION) so declared_layout is
 // committed before we decide whether to bridge a Conv→Sigmoid SKIP-alias —
 // see kb/conv_silu_fusion_blocker.md.
-struct fuse_post_ops_silu_pass_t : pass_t {
-    bool apply(graph_optimizer_t& opt, context_t* ctx) override
-    {
-        if (!opt.fusion_enabled) return false;
-        fuse_post_ops_silu(ctx);
-        return false;  // idempotent; no cascade
-    }
-    const char*  name()  const override { return "fuse_post_ops_silu"; }
-    pass_level_t level() const override { return pass_level_t::LAYOUT; }
-    bool         once()  const override { return true; }
-};
+DEFINE_GATED_PASS(fuse_post_ops_silu_pass_t, fuse_post_ops_silu,
+                  "fuse_post_ops_silu", LAYOUT, true);
 
 // M7+ #2: eliminate redundant NCHW<->NHWC reorders left by assign_layouts.
 // Currently a no-op scaffold — real logic lives in optimize_transposes.cpp.
@@ -428,6 +319,10 @@ struct prune_segments_pass_t : pass_t {
     pass_level_t level() const override { return pass_level_t::SCHEDULING; }
     bool         once()  const override { return true; }
 };
+
+#undef DEFINE_SIMPLE_PASS
+#undef DEFINE_GATED_PASS
+#undef DEFINE_FUSION_FP_PASS
 
 // ---------------------------------------------------------------------------
 // pass_graph_optimizer_t — arch-agnostic base

@@ -1,4 +1,5 @@
 #include "graph_optimizer/graph_optimizer_internal.h"
+#include "graph_optimizer/qdq_helpers.h"
 
 namespace nnr {
 
@@ -63,25 +64,8 @@ void fuse_qdq_compute(context_t* ctx)
     // Build two producer maps:
     // - producer: active nodes only (for activation DQ and Q detection)
     // - all_producer: includes folded nodes (for weight/bias DQ that fold_run pre-folded)
-    std::unordered_map<tensor_t*, int> producer, all_producer;
-    for (int i = 0; i < n; i++) {
-        for (auto* t : nodes[i]->outputs)
-            all_producer[t] = i;
-        if (nodes[i]->skip || nodes[i]->folded) continue;
-        for (auto* t : nodes[i]->outputs)
-            producer[t] = i;
-    }
-
-    // Count consumers of a tensor (excluding skip/folded nodes and a specific index)
-    auto count_consumers = [&](tensor_t* tensor, int skip_idx) -> int {
-        int count = 0;
-        for (int j = 0; j < n; j++) {
-            if (j == skip_idx || nodes[j]->skip || nodes[j]->folded) continue;
-            for (auto* t : nodes[j]->inputs)
-                if (t == tensor) count++;
-        }
-        return count;
-    };
+    auto producer     = qdq_helpers::build_producer_map(nodes);
+    auto all_producer = qdq_helpers::build_producer_map(nodes, /*include_folded=*/true);
 
     // Find the single consumer Q node for a tensor, or -1
     auto find_q_consumer = [&](tensor_t* tensor, int src_idx) -> int {
@@ -152,7 +136,7 @@ void fuse_qdq_compute(context_t* ctx)
         // --- Check output goes to a single Q node ---
         if (op->outputs.empty() || !op->outputs[0]) continue;
         tensor_t* op_output = op->outputs[0];
-        if (count_consumers(op_output, i) != 1) continue;
+        if (qdq_helpers::count_consumers(nodes,op_output, i) != 1) continue;
         int q_idx = find_q_consumer(op_output, i);
         if (q_idx < 0) continue;
         operator_t* q_y = nodes[q_idx];
@@ -222,7 +206,7 @@ void fuse_qdq_compute(context_t* ctx)
         nodes[i] = placed;
         // Only fold activation DQ if no other active consumers remain
         // (fused node bypasses dq_x, so check after replacement)
-        if (count_consumers(dq_x->outputs[0], all_producer[op->inputs[0]]) == 0)
+        if (qdq_helpers::count_consumers(nodes,dq_x->outputs[0], all_producer[op->inputs[0]]) == 0)
             dq_x->folded = true;
         dq_w->folded = true;
         if (dq_bias) dq_bias->folded = true;
@@ -302,7 +286,7 @@ void fuse_qdq_compute(context_t* ctx)
         // Output must go to a single Q node (possibly via Relu)
         if (op->outputs.empty() || !op->outputs[0]) continue;
         tensor_t* add_output = op->outputs[0];
-        if (count_consumers(add_output, i) != 1) continue;
+        if (qdq_helpers::count_consumers(nodes,add_output, i) != 1) continue;
 
         // Check for optional Relu between Add and Q
         int relu_idx = -1;
@@ -319,7 +303,7 @@ void fuse_qdq_compute(context_t* ctx)
             if (consumer >= 0 && nodes[consumer]->op_type == "Relu") {
                 relu_idx = consumer;
                 pre_q_output = nodes[consumer]->outputs[0];
-                if (count_consumers(pre_q_output, consumer) != 1) continue;
+                if (qdq_helpers::count_consumers(nodes,pre_q_output, consumer) != 1) continue;
             }
         }
 
@@ -358,9 +342,9 @@ void fuse_qdq_compute(context_t* ctx)
 
         // Replace Add node, fold source DQ/Q/Relu
         nodes[i] = placed;
-        if (count_consumers(dq_a->outputs[0], all_producer[op->inputs[0]]) == 0)
+        if (qdq_helpers::count_consumers(nodes,dq_a->outputs[0], all_producer[op->inputs[0]]) == 0)
             dq_a->folded = true;
-        if (count_consumers(dq_b->outputs[0], all_producer[op->inputs[1]]) == 0)
+        if (qdq_helpers::count_consumers(nodes,dq_b->outputs[0], all_producer[op->inputs[1]]) == 0)
             dq_b->folded = true;
         if (relu_idx >= 0)
             nodes[relu_idx]->folded = true;

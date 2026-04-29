@@ -43,6 +43,7 @@
 // reorder cost is not modeled; adjacent blocked ops collapse their
 // reorders naturally at runtime (see nnr.cpp wants_blocked handling).
 #include "graph_optimizer/graph_optimizer_internal.h"
+#include "graph_optimizer/qdq_helpers.h"
 #include "thread_pool.h"
 #include "cpu_features.h"
 
@@ -143,15 +144,13 @@ void assign_blocked_layouts(context_t* ctx)
     // connected eligible Convs. The groups are not used for accept/reject
     // decisions — they exist so --debug-layout can print chain summaries.
     std::unordered_map<tensor_t*, std::vector<int>> tensor_consumers;
-    std::unordered_map<tensor_t*, int> tensor_producer;
     for (int i = 0; i < n; ++i) {
         for (auto* t : nodes[i]->inputs) {
             if (t) tensor_consumers[t].push_back(i);
         }
-        for (auto* t : nodes[i]->outputs) {
-            if (t) tensor_producer[t] = i;
-        }
     }
+    auto tensor_producer = qdq_helpers::build_producer_map(
+        nodes, /*include_folded=*/true);
 
     auto find_downstream_convs = [&](int start_idx) {
         std::vector<int> queue;

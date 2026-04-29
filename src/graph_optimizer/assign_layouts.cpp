@@ -1,4 +1,5 @@
 #include "graph_optimizer/graph_optimizer_internal.h"
+#include "graph_optimizer/qdq_helpers.h"
 
 namespace nnr {
 
@@ -41,12 +42,8 @@ void assign_layouts(context_t* ctx)
         if (t) graph_outputs.insert(t);
     }
 
-    std::unordered_map<tensor_t*, int> tensor_producer;
-    for (int i = 0; i < n; i++) {
-        auto* op = nodes[i];
-        for (auto* t : op->outputs)
-            if (t) tensor_producer[t] = i;
-    }
+    auto tensor_producer = qdq_helpers::build_producer_map(
+        nodes, /*include_folded=*/true);
 
     // Follow skip-chain: resolve a tensor through skipped ops, optionally
     // calling fn(op) on each skipped op encountered along the way.

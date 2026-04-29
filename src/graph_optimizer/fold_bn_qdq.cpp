@@ -1,4 +1,5 @@
 #include "graph_optimizer/graph_optimizer_internal.h"
+#include "graph_optimizer/qdq_helpers.h"
 
 namespace nnr {
 
@@ -27,24 +28,7 @@ void fold_bn_qdq(context_t* ctx)
     const int n = static_cast<int>(nodes.size());
     int folded_count = 0;
 
-    // Build producer map
-    std::unordered_map<tensor_t*, int> producer;
-    for (int i = 0; i < n; i++) {
-        if (nodes[i]->skip || nodes[i]->folded) continue;
-        for (auto* t : nodes[i]->outputs)
-            producer[t] = i;
-    }
-
-    // Count consumers
-    auto count_consumers = [&](tensor_t* tensor, int skip_idx) -> int {
-        int count = 0;
-        for (int j = 0; j < n; j++) {
-            if (j == skip_idx || nodes[j]->skip || nodes[j]->folded) continue;
-            for (auto* t : nodes[j]->inputs)
-                if (t == tensor) count++;
-        }
-        return count;
-    };
+    auto producer = qdq_helpers::build_producer_map(nodes);
 
     for (int i = 0; i < n; i++) {
         operator_t* dq = nodes[i];
@@ -53,7 +37,7 @@ void fold_bn_qdq(context_t* ctx)
         if (dq->outputs.empty() || dq->inputs.size() < 2) continue;
 
         tensor_t* dq_out = dq->outputs[0];
-        if (count_consumers(dq_out, i) != 1) continue;
+        if (qdq_helpers::count_consumers(nodes,dq_out, i) != 1) continue;
 
         // Find BN consumer
         int bn_idx = -1;
@@ -69,7 +53,7 @@ void fold_bn_qdq(context_t* ctx)
         operator_t* bn = nodes[bn_idx];
         if (bn->inputs.size() < 5 || bn->outputs.empty()) continue;
         tensor_t* bn_out = bn->outputs[0];
-        if (count_consumers(bn_out, bn_idx) != 1) continue;
+        if (qdq_helpers::count_consumers(nodes,bn_out, bn_idx) != 1) continue;
 
         // Find Q consumer of BN
         int q_idx = -1;
@@ -179,7 +163,7 @@ void fold_bn_qdq(context_t* ctx)
         if (!bn_in || bn_in->type != NNR_DATA_TYPE_FLOAT32) continue;
 
         tensor_t* bn_out = bn->outputs[0];
-        if (count_consumers(bn_out, i) != 1) continue;
+        if (qdq_helpers::count_consumers(nodes,bn_out, i) != 1) continue;
 
         // Find Q consumer of BN
         int q_idx = -1;
