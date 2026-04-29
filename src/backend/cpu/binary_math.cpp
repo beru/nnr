@@ -9,7 +9,10 @@
 #ifdef NNR_ARCH_X64
 #include "backend/x64/simd_math_avx512.h"
 #include "backend/x64/simd_math_avx2.h"
+#include "backend/x64/vec_ops_avx512.h"
+#include "backend/x64/vec_ops_avx2.h"
 #include "backend/x64/ops_x64.h"
+#include "cpu_features.h"
 #elifdef NNR_ARCH_ARM64
 #include "backend/arm/conv_neon.h"
 #endif
@@ -90,6 +93,11 @@ struct Add_op : public binary_arith_op_t<Add_op,
             int row_off = offset + r * stride;
 #ifdef NNR_ARCH_ARM64
             add_skip_bias_neon(row, skip, cols, row_off, bv);
+#elif defined(NNR_ARCH_X64)
+            if (has_avx512())
+                avx512::add_skip_bias(row, skip + row_off, cols, bv);
+            else
+                avx2::add_skip_bias(row, skip + row_off, cols, bv);
 #else
             for (int i = 0; i < cols; ++i)
                 row[i] += skip[row_off + i] + bv;

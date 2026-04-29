@@ -83,6 +83,28 @@ inline void bias_add(float* __restrict data, int len, float bias)
         data[i] += bias;
 }
 
+// Fused binary Add: data[i] += skip[i] + bias.
+// @nnr-meta isa=AVX2 dtype=fp32 fusion=binary
+inline void add_skip_bias(float* __restrict data, const float* __restrict skip,
+                          int len, float bias)
+{
+    __m256 vb = _mm256_set1_ps(bias);
+    int i = 0;
+    if (bias == 0.0f) {
+        for (; i + 8 <= len; i += 8)
+            _mm256_storeu_ps(data + i, _mm256_add_ps(_mm256_loadu_ps(data + i),
+                                                    _mm256_loadu_ps(skip + i)));
+        for (; i < len; ++i) data[i] += skip[i];
+    } else {
+        for (; i + 8 <= len; i += 8) {
+            __m256 d = _mm256_loadu_ps(data + i);
+            __m256 s = _mm256_loadu_ps(skip + i);
+            _mm256_storeu_ps(data + i, _mm256_add_ps(d, _mm256_add_ps(s, vb)));
+        }
+        for (; i < len; ++i) data[i] += skip[i] + bias;
+    }
+}
+
 // HardSwish: data[i] = (data[i] + bias) * clamp((data[i] + bias) / 6 + 0.5, 0, 1)
 // @nnr-meta isa=AVX2 dtype=fp32 fusion=post_op
 inline void bias_hardswish(float* __restrict data, int len, float bias)

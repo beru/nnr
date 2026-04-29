@@ -278,7 +278,7 @@
                         if (post_fn) {
                             const int OCb = (M + block - 1) / block;
                             const int total = oN * OCb * oH * oW * block;
-                            post_fn(out_nchwc_w, 1, total, total, fused_op, nullptr, 0);
+                            nnr::apply_post_fn_parallel(post_fn, out_nchwc_w, total, fused_op);
                         }
                         y->format = y->declared_layout;
                         return true;
@@ -362,7 +362,7 @@
                     // all tensors share the same element ordering at the same spatial dims.
                     if (post_fn) {
                         const int total = oN * OCb * oH * oW * block;
-                        post_fn(out_nchwc, 1, total, total, fused_op, nullptr, 0);
+                        nnr::apply_post_fn_parallel(post_fn, out_nchwc, total, fused_op);
                     }
 
                     if (!y_is_blocked) {
@@ -419,7 +419,7 @@
                     if (post_fn) {
                         const int OCb = (M + block - 1) / block;
                         const int total = oN * OCb * oH * oW * block;
-                        post_fn(out_nchwc, 1, total, total, fused_op, nullptr, 0);
+                        nnr::apply_post_fn_parallel(post_fn, out_nchwc, total, fused_op);
                     }
 
                     y->format = y->declared_layout;
@@ -759,7 +759,7 @@
 
                     // Post-op: skip if already fused into GEMM for group==1
                     if (group != 1 && post_fn)
-                        post_fn(yd, 1, (int)((size_t)oN * spatial * M), (int)((size_t)oN * spatial * M), fused_op, nullptr, 0);
+                        nnr::apply_post_fn_parallel(post_fn, yd, (int)((size_t)oN * spatial * M), fused_op);
 
                     y->format = y->declared_layout;
                     return true;

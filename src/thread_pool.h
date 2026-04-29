@@ -778,6 +778,48 @@ inline int elementwise_threads(size_t N, float bytes_in, float bytes_out, float 
 #endif
 }
 
+// Apply an operator_t-style fused post-op (Conv+Relu, Conv+Add+Relu, etc.) over
+// a flat output buffer in parallel chunks. Mirrors the single-row sequential
+// pattern `post_fn(data, 1, total, total, fused_op, nullptr, base_offset)` but
+// splits the work along the linear axis so multi-core memory bandwidth is used.
+// Each chunk preserves the absolute `offset` semantics needed by binary-fused
+// post-ops (Add reads `skip[offset+i]`); chunk t sees offset = base_offset + chunk_start.
+//
+// Tuning: kicks in only above MIN_PARALLEL elements — below that, dispatch overhead
+// (~5-15µs on Strix Point) eclipses the few-µs single-core post-op work. Above the
+// threshold, splits work evenly across `min(total/16K, num_physical())` workers so
+// each worker has at least 64 KB of fp32 to chew on (one full L2 working set on Zen 5).
+// Splits are 16-element-aligned so per-chunk inner SIMD kernels keep alignment.
+template <typename PostFn, typename FusedOp>
+inline void apply_post_fn_parallel(PostFn fn, float* data, int total,
+                                   FusedOp* fused_op, int base_offset = 0) {
+    if (!fn || total <= 0) return;
+#ifndef NNR_NO_THREAD_POOL
+    constexpr int MIN_PARALLEL = 64 * 1024;
+    if (total >= MIN_PARALLEL) {
+        auto& pool = nnr::thread_pool_t::get();
+        int nthreads = total / 16384;
+        if (nthreads > pool.num_physical()) nthreads = pool.num_physical();
+        if (nthreads >= 2) {
+            nnr::for_static(0, nthreads, nthreads, [&](int t) {
+                int s = (int)((int64_t)t * total / nthreads);
+                int e = (int)((int64_t)(t + 1) * total / nthreads);
+                // Align inner boundaries to a 16-float lane so each chunk's SIMD
+                // store stays aligned with the conv-kernel's natural cadence;
+                // first chunk starts at 0, last chunk runs to `total`.
+                if (t > 0)               s = (s + 15) & ~15;
+                if (t + 1 < nthreads)    e = (e + 15) & ~15;
+                else                     e = total;
+                if (e <= s) return;
+                fn(data + s, 1, e - s, e - s, fused_op, nullptr, base_offset + s);
+            });
+            return;
+        }
+    }
+#endif
+    fn(data, 1, total, total, fused_op, nullptr, base_offset);
+}
+
 // Put all worker threads into deep sleep (zero CPU when idle).
 // Call after load/prepare when no inference is expected for a while.
 // Workers auto-wake on next dispatch (run/for_static/for_dynamic).

@@ -184,7 +184,7 @@ bool exec_conv_nhwc_general(float* bias) {
 
     // Post-op: skip if already fused into GEMM for group==1
     if (group != 1 && post_fn)
-        post_fn(yd, 1, (int)((size_t)oN * spatial * M), (int)((size_t)oN * spatial * M), fused_op, nullptr, 0);
+        nnr::apply_post_fn_parallel(post_fn, yd, (int)((size_t)oN * spatial * M), fused_op);
 
     y->format = memory_layout_t::NHWC;
     return true;

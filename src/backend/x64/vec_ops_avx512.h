@@ -71,6 +71,31 @@ inline void bias_add(float* __restrict data, int len, float bias)
         data[i] += bias;
 }
 
+// Fused binary Add: data[i] += skip[i] + bias. The hot inner loop for
+// Conv+Add(+Relu) residual fusion (ResNet/MobileNet/EfficientNet bottlenecks).
+// @nnr-meta isa=AVX512 dtype=fp32 fusion=binary
+inline void add_skip_bias(float* __restrict data, const float* __restrict skip,
+                          int len, float bias)
+{
+    __m512 vb = _mm512_set1_ps(bias);
+    int i = 0;
+    if (bias == 0.0f) {
+        for (; i + 16 <= len; i += 16)
+            _mm512_storeu_ps(data + i, _mm512_add_ps(_mm512_loadu_ps(data + i),
+                                                    _mm512_loadu_ps(skip + i)));
+        for (; i < len; ++i)
+            data[i] += skip[i];
+    } else {
+        for (; i + 16 <= len; i += 16) {
+            __m512 d = _mm512_loadu_ps(data + i);
+            __m512 s = _mm512_loadu_ps(skip + i);
+            _mm512_storeu_ps(data + i, _mm512_add_ps(d, _mm512_add_ps(s, vb)));
+        }
+        for (; i < len; ++i)
+            data[i] += skip[i] + bias;
+    }
+}
+
 // HardSwish: data[i] = (data[i] + bias) * clamp((data[i] + bias) / 6 + 0.5, 0, 1)
 // @nnr-meta isa=AVX512 dtype=fp32 fusion=post_op
 inline void bias_hardswish(float* __restrict data, int len, float bias)

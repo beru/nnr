@@ -294,6 +294,28 @@
                 sH, sW, pH, pW,
                 /*post_fn=*/nullptr,
                 out_row_start, out_end);
+            // Apply fused post-op over the just-computed strip. Mirrors the
+            // 1×1 / Wino strip paths above; the prior version forgot this
+            // step, so any segment whose general-path Conv had a fused
+            // Relu/Clip/etc. emitted unclipped output and caused downstream
+            // numerical drift (e.g. adv_inception_v3 segs with 1×7 / 3×3-s2).
+            if (post_fn) {
+                const int OCb = (M + block - 1) / block;
+                const int strip_rows = out_end - out_row_start;
+                const size_t strip_floats = (size_t)strip_rows * oW * block;
+                for (int n = 0; n < oN; ++n) {
+                    float* yn = out_nchwc + (size_t)n * OCb * oH * oW * block;
+                    for (int ob = 0; ob < OCb; ++ob) {
+                        float* strip = yn + (size_t)ob * oH * oW * block
+                                          + (size_t)out_row_start * oW * block;
+                        int off = (int)((size_t)n * OCb * oH * oW * block
+                                      + (size_t)ob * oH * oW * block
+                                      + (size_t)out_row_start * oW * block);
+                        post_fn(strip, 1, (int)strip_floats, (int)strip_floats,
+                                fused_op, nullptr, off);
+                    }
+                }
+            }
             return true;
         }
 #endif
@@ -346,7 +368,6 @@
                         gemm_post_t((const float*)bias, g * MM, yn, yn_off, this));
                     continue;
                 }
-
                 // im2col for the strip + GEMM
                 float* col = (float*)ctx->workspace;
                 for (int c = 0; c < kC; ++c) {

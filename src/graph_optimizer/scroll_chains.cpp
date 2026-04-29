@@ -358,6 +358,68 @@ void detect_scroll_chains(graph_optimizer_t* opt, context_t* ctx)
     }
     try_emit_chain(n - 1);
 
+    // Diagnostic: NNR_DUMP_SEGS_OPS=1 dumps the active ops in each segment.
+    if (std::getenv("NNR_DUMP_SEGS_OPS")) {
+        for (size_t k = 0; k < opt->scroll_segments.size(); ++k) {
+            const auto& s = opt->scroll_segments[k];
+            fprintf(stderr, "[scroll-seg-ops] %zu: [%d,%d) strip_h=%d\n",
+                    k, s.start, s.end, s.strip_height);
+            for (int i = s.start; i < s.end; ++i) {
+                auto* nd = nodes[i];
+                int kH = -1, kW = -1;
+                if (nd->op_type == "Conv" && nd->inputs.size() >= 2 && nd->inputs[1]
+                    && nd->inputs[1]->ndim == 4) {
+                    kH = (int)nd->inputs[1]->dims[2];
+                    kW = (int)nd->inputs[1]->dims[3];
+                }
+                fprintf(stderr, "  [%d] %.*s skip=%d folded=%d kH=%d kW=%d\n",
+                        i, (int)nd->op_type.size(), nd->op_type.data(),
+                        nd->skip, nd->folded, kH, kW);
+            }
+        }
+    }
+
+    // Diagnostic: NNR_DROP_SEG=<i>[,<j>...] drops scroll segments by index
+    // (post-detection, pre-prune). NNR_KEEP_SEG=<i>[,<j>...] keeps only the
+    // listed segments. Used for bisecting which strip kernel(s) misbehave.
+    // Always logs the segment table so an external observer can correlate
+    // indices with [start,end) ranges.
+    if (const char* dump = std::getenv("NNR_DUMP_SEGS"); dump && *dump) {
+        for (size_t k = 0; k < opt->scroll_segments.size(); ++k) {
+            const auto& s = opt->scroll_segments[k];
+            fprintf(stderr, "[scroll-seg] %zu: [%d,%d) strip_h=%d\n",
+                    k, s.start, s.end, s.strip_height);
+        }
+    }
+    auto parse_idx_list = [](const char* s, std::vector<int>& out) {
+        if (!s || !*s) return;
+        const char* p = s;
+        while (*p) {
+            char* e = nullptr;
+            long v = strtol(p, &e, 10);
+            if (e == p) break;
+            out.push_back((int)v);
+            p = e;
+            while (*p == ',' || *p == ' ') ++p;
+        }
+    };
+    std::vector<int> drop, keep;
+    parse_idx_list(std::getenv("NNR_DROP_SEG"), drop);
+    parse_idx_list(std::getenv("NNR_KEEP_SEG"), keep);
+    if (!drop.empty() || !keep.empty()) {
+        std::vector<scroll_segment_t> filtered;
+        for (size_t k = 0; k < opt->scroll_segments.size(); ++k) {
+            bool in_drop = std::find(drop.begin(), drop.end(), (int)k) != drop.end();
+            bool in_keep = std::find(keep.begin(), keep.end(), (int)k) != keep.end();
+            bool emit = !in_drop;
+            if (!keep.empty()) emit = emit && in_keep;
+            if (emit) filtered.push_back(opt->scroll_segments[k]);
+            else fprintf(stderr, "[scroll-seg] dropping %zu: [%d,%d)\n",
+                         k, opt->scroll_segments[k].start, opt->scroll_segments[k].end);
+        }
+        opt->scroll_segments = std::move(filtered);
+    }
+
     opt->scroll_detection_done = true;
 }
 
@@ -446,6 +508,70 @@ bool graph_optimizer_t::exec_scroll_segment(context_t* ctx, int seg_start, int s
                     p = it->second;
             }
             producer_of[k].push_back(p);
+        }
+    }
+
+    // Skip-node aliases inside the segment.
+    //
+    // A node with `skip=true` whose output tensor lives between two active ops
+    // of the segment (e.g. a Clip absorbed into a preceding Conv as a post-op
+    // fusion) does not get a SCROLL_INSIDE plan entry — build_plan() leaves
+    // its plan as SKIP, so build_exec_steps() emits the regular SKIP step
+    // (`scroll_seg=-2`). That step fires *after* this segment finishes running
+    // — far too late: while the segment runs strip-by-strip, the skip output
+    // tensor's `data` still points at its uninitialized backing buffer, and
+    // any in-segment downstream consumer (depthwise reading clip's output) is
+    // reading garbage.
+    //
+    // Mirror the producer's tensor state (data/dims[2]/ndata/format) onto each
+    // aliased skip output for the duration of the segment. We only do this
+    // for skip outputs that are *actually read* by a downstream active op
+    // inside the segment — leaving externally-consumed skip outputs alone
+    // matches pre-fix behavior (the post-segment SKIP step handles them).
+    std::unordered_set<tensor_t*> consumed_inside;
+    for (int k = 0; k < num_ops; ++k)
+        for (auto* in_t : ops[k]->inputs)
+            if (in_t) consumed_inside.insert(in_t);
+
+    struct skip_alias_t {
+        tensor_t* t;
+        int       p;            // index into ops[]
+        void*     saved_data;
+        int       saved_dims2;
+        size_t    saved_ndata;
+        memory_layout_t saved_fmt;
+    };
+    small_vector<skip_alias_t, 16> skip_aliases;
+    for (int i = seg_start; i < seg_end; ++i) {
+        auto* node = nodes[i];
+        if (!node->skip || node->folded) continue;
+        for (auto* t : node->outputs) {
+            if (!t) continue;
+            auto it = tensor_to_op.find(t);
+            if (it == tensor_to_op.end()) continue;
+            if (consumed_inside.find(t) == consumed_inside.end()) continue;
+            // Pass-through gate: the producer's ring-redirected pointer is
+            // only safe to share if the alias is a true noop (same dtype,
+            // ndim, dims, declared layout). DQ/Q/Reshape style skips that
+            // change any of these are left alone — pre-fix behavior. Their
+            // post-segment SKIP step still fires for out-of-segment readers.
+            auto* src = ops[it->second]->outputs[0];
+            if (t->type != src->type) continue;
+            if (t->ndim != src->ndim) continue;
+            if (t->declared_layout != src->declared_layout) continue;
+            bool dims_match = true;
+            for (int d = 0; d < t->ndim; ++d) {
+                if (t->dims[d] != src->dims[d]) { dims_match = false; break; }
+            }
+            if (!dims_match) continue;
+            skip_alias_t a;
+            a.t = t;
+            a.p = it->second;
+            a.saved_data  = t->data;
+            a.saved_dims2 = (t->ndim >= 3) ? t->dims[2] : 0;
+            a.saved_ndata = t->ndata;
+            a.saved_fmt   = t->format;
+            skip_aliases.push_back(a);
         }
     }
 
@@ -669,6 +795,18 @@ bool graph_optimizer_t::exec_scroll_segment(context_t* ctx, int seg_start, int s
             t->format = rings[k].saved_fmt;
         }
 
+        // Mirror each producer's current (possibly ring-redirected) tensor
+        // state onto its aliased skip-node output tensors. Must run after the
+        // ring-pointer update above so we copy the redirected pointer, not
+        // the saved one.
+        for (auto& a : skip_aliases) {
+            auto* src = ops[a.p]->outputs[0];
+            a.t->data = src->data;
+            if (a.t->ndim >= 3 && src->ndim >= 3) a.t->dims[2] = src->dims[2];
+            a.t->ndata  = src->ndata;
+            a.t->format = src->format;
+        }
+
         // Set ring_in/ring_out on operators for boundary/padding checks.
         // ring_in tracks the PRIMARY input's producer ring (producer_of[k][0])
         // — strip kernels read that one for halo/clamp metadata. Secondary
@@ -729,12 +867,27 @@ bool graph_optimizer_t::exec_scroll_segment(context_t* ctx, int seg_start, int s
         t->ndata = rings[k].saved_ndata;
     }
 
+    // Restore in-segment skip-node aliased tensors. The post-segment SKIP
+    // step (build_exec_steps emitted one for each skip node, regardless of
+    // segment membership) fires next and re-aliases data to the producer's
+    // restored full-output buffer for any out-of-segment consumers.
+    for (auto& a : skip_aliases) {
+        a.t->data = a.saved_data;
+        if (a.t->ndim >= 3) a.t->dims[2] = a.saved_dims2;
+        a.t->ndata  = a.saved_ndata;
+        a.t->format = a.saved_fmt;
+    }
+
     // Clear ring state on operators
     for (int k = 0; k < num_ops; ++k) {
         ops[k]->ring_in = {};
         ops[k]->ring_out = {};
     }
 
+    if (std::getenv("NNR_TRACE_STRIP")) {
+        fprintf(stderr, "[strip-seg] [%d,%d) strip_h=%d ops=%d -> %s\n",
+                seg_start, seg_end, strip_height, num_ops, ok ? "OK" : "FALLBACK");
+    }
     return ok;
 }
 

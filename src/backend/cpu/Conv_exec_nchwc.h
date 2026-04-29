@@ -92,7 +92,7 @@ bool exec_conv_nchwc(float* bias) {
     if (post_fn) {
         const int OCb = (M + block - 1) / block;
         const int total = oN * OCb * oH * oW * block;
-        post_fn(out_nchwc, 1, total, total, fused_op, nullptr, 0);
+        nnr::apply_post_fn_parallel(post_fn, out_nchwc, total, fused_op);
     }
 
     y->format = memory_layout_t::BLOCKED_16;
